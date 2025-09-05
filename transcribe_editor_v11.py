@@ -1,7 +1,7 @@
 # transcribe_editor_v11.py
 # -------------------------------------------------------------
 # 機能:
-# 1) 音声/動画アップロード → OpenAIで文字起こし
+# 1) 音声/動画アップロード → OpenAIで文字起こし（50MBまで直接可、超過は自動分割）
 # 2) 出力選択: 逐語(タイムスタンプ) / 直訳（日本語化のみ）/ 議事録 / 要旨 / 記事 / ガイドライン解説
 # 3) 目的選択: 学会発表 / ガイドライン解説 / ディスカッション（LLM整形に反映）
 # 4) 動画オプション: スライドOCR(キーフレーム抽出 + OCR) 併用の可否（依存が無ければ自動でスキップ）
@@ -53,30 +53,34 @@ except Exception:
     cv2 = None
     Image = None
 
-
+# OpenAI v1
 from openai import OpenAI
-# OpenAIクライアントを安全に生成
+
+# ========== OpenAIクライアント生成（Azure互換） ==========
 def get_openai_client(api_key: str) -> OpenAI:
+    base = os.environ.get("OPENAI_BASE_URL")  # 例: https://{resource}.openai.azure.com/openai/v1
+    if base:
+        return OpenAI(api_key=api_key, base_url=base)
     return OpenAI(api_key=api_key)
 
-# ========== ランタイム共通ストア（起動中のみ保持。毎回の起動時に設定し直し） ==========
+# ========== ランタイム共通ストア（起動中のみ保持） ==========
 @st.cache_resource(show_spinner=False)
 def runtime_config():
     return {
         "common_password": None,   # 初回セットアップで管理者が設定
         "default_api_key": None,   # 任意：既定のAPIキー。未設定なら各ユーザーが毎回入力
     }
+
 # ========== ログイン＆APIキー取得（毎回サイドバーで入力） ==========
 def require_login_and_api() -> str:
     cfg = runtime_config()
-
     with st.sidebar:
         st.header("🔐 アクセス")
 
         # ⚙️ 管理者リセット（任意）
         with st.expander("⚙️ 管理者メニュー（リセット）"):
             reset_token = st.text_input("RESET と入力して有効化", key="reset_token")
-            if st.button("初期セットアップをやり直す"):
+            if st.button("初期セットアップをやり直す", key="btn_reset_setup"):
                 if reset_token.strip().upper() != "RESET":
                     st.warning("RESET と入力してください。")
                 else:
@@ -91,11 +95,11 @@ def require_login_and_api() -> str:
                         except Exception:
                             pass
 
-        # ── 初回セットアップ：共通パスワードのみ設定（APIキーは保存しない）
+        # 初回セットアップ：共通パスワードのみ設定
         if not cfg["common_password"]:
             st.info("初回セットアップ：共通パスワードのみ設定（APIキーは保存しません）")
-            new_pw = st.text_input("共通パスワード（必須）", type="password")
-            if st.button("保存"):
+            new_pw = st.text_input("共通パスワード（必須）", type="password", key="pw_setup")
+            if st.button("保存", key="btn_save_pw"):
                 if not new_pw:
                     st.error("共通パスワードは必須です。")
                 else:
@@ -111,11 +115,11 @@ def require_login_and_api() -> str:
                             pass
             st.stop()
 
-        # ── 通常ログイン：毎回 パスワード＋APIキー を入力
-        pw = st.text_input("共通パスワードを入力", type="password")
-        user_key = st.text_input("OpenAI APIキー（必須）", type="password")
+        # 通常ログイン：毎回 パスワード＋APIキー を入力
+        pw = st.text_input("共通パスワードを入力", type="password", key="pw_login")
+        user_key = st.text_input("OpenAI APIキー（必須）", type="password", key="user_api")
 
-        if st.button("ログイン"):
+        if st.button("ログイン", key="btn_login"):
             if pw != cfg["common_password"]:
                 st.error("パスワードが違います。")
                 st.stop()
@@ -140,11 +144,6 @@ def require_login_and_api() -> str:
         st.error("OpenAI APIキーが未入力です。サイドバーに入力してください。")
         st.stop()
     return api_key
-# ========== OpenAI クライアント生成 ==========
-def get_openai_client(api_key: str) -> OpenAI:
-    base = os.environ.get("OPENAI_BASE_URL")  # Azureを使うなら環境変数でベースURLを指定
-    return OpenAI(api_key=api_key, base_url=base)
-
 
 # ========== 文字ユーティリティ ==========
 def split_text_by_chars(text: str, chunk_size: int = 6000, overlap: int = 300) -> list[str]:
@@ -167,7 +166,6 @@ def split_text_by_chars(text: str, chunk_size: int = 6000, overlap: int = 300) -
         start = max(cut - overlap, 0)
     return [c for c in chunks if c]
 
-
 def strip_timestamps(text: str) -> str:
     pattern = re.compile(
         r"^\s*\[\d{2}:\d{2}:\d{2}(?:\.\d{3})?\s*(?:→|->|-|－|—)\s*\d{2}:\d{2}:\d{2}(?:\.\d{3})?\]\s*",
@@ -175,15 +173,13 @@ def strip_timestamps(text: str) -> str:
     )
     return pattern.sub("", text).strip()
 
-
-# ========== FFmpeg/ffprobe 検出（Cloudでは packages.txt: ffmpeg でOK） ==========
+# ========== FFmpeg/ffprobe 検出 ==========
 PROJECT_DIR = Path(__file__).parent
 FFBIN_CANDIDATES = [
     PROJECT_DIR / "ffmpeg-7.0.2-essentials_build" / "bin",
     Path(r"C:\\Users\\s-has\\Desktop\\動画音声原稿作成082025\\ffmpeg-7.0.2-essentials_build\\bin"),
     Path(r"C:\\Users\\s-has\\Desktop\\ffmpeg-7.0.2-essentials_build\\bin"),
 ]
-
 FFMPEG_EXE = None
 FFPROBE_EXE = None
 for _bin in FFBIN_CANDIDATES:
@@ -210,7 +206,6 @@ else:
         FFPROBE_EXE = Path(ffprobe_found)
         AudioSegment.ffprobe = ffprobe_found
 
-
 # ========== I/O ユーティリティ ==========
 def save_uploaded_file_to_temp(uploaded_file) -> str:
     suffix = os.path.splitext(uploaded_file.name)[1]
@@ -219,35 +214,28 @@ def save_uploaded_file_to_temp(uploaded_file) -> str:
         f.write(uploaded_file.getbuffer())
     return tmp_path
 
-
 def ensure_wav(input_path: str) -> str:
     """アップロードされたファイルを 16kHz/mono の WAV に変換。
        pydub→失敗時は ffmpeg CLI にフォールバック。"""
     wav_path = os.path.splitext(input_path)[0] + "_16k.wav"
-
-    # 1) まずは pydub で普通に読む
+    # 1) まずは pydub
     try:
         audio = AudioSegment.from_file(input_path)
         audio = audio.set_channels(1).set_frame_rate(16000)
         audio.export(wav_path, format="wav")
         return wav_path
-    except Exception as e1:
+    except Exception:
         pass  # フォールバックへ
 
     # 2) フォールバック: ffmpeg CLI で “修復→音声抽出”
     ff = shutil.which("ffmpeg") or "ffmpeg"
-
-    # 2-1) moov 位置の問題を回避（コピーリマックス）
     fixed_mp4 = os.path.splitext(input_path)[0] + "_fixed.mp4"
     try:
         p1 = subprocess.run(
             [ff, "-y", "-v", "error", "-i", input_path, "-c", "copy", "-movflags", "+faststart", fixed_mp4],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore"
         )
-        # リマックスに失敗しても続行（元を使う）
         src_for_audio = fixed_mp4 if os.path.exists(fixed_mp4) and p1.returncode == 0 else input_path
-
-        # 2-2) 音声だけ取り出して WAV 化
         p2 = subprocess.run(
             [ff, "-y", "-v", "error", "-i", src_for_audio,
              "-vn", "-ac", "1", "-ar", "16000", "-map", "0:a:0?",
@@ -260,17 +248,51 @@ def ensure_wav(input_path: str) -> str:
     except Exception as e2:
         st.error(
             "音声/動画の読み込みに失敗しました。\n"
-            "ファイルが壊れているかアップロードが途中で切れた可能性があります。\n"
             "（小さめのファイルで再アップロード、あるいは mp3/m4a でのアップをお試しください）\n\n"
             f"詳細: {e2}"
         )
         st.stop()
 
-    audio = audio.set_channels(1).set_frame_rate(16000)
-    wav_path = os.path.splitext(input_path)[0] + "_16k.wav"
-    audio.export(wav_path, format="wav")
-    return wav_path
+# ---- アップロード前の軽量化（まずはMP3 32kbps monoを試す）----
+def shrink_audio_for_upload(src_path: str, target_mb: float = 50.0) -> tuple[str, float, str]:
+    """
+    return: (使うファイルパス, サイズMB, モード)
+      モード: "original" / "mp3-32k" / "too_large"
+    """
+    try:
+        size_mb = os.path.getsize(src_path) / (1024 * 1024)
+    except Exception:
+        return src_path, 0.0, "original"
+    if size_mb <= target_mb:
+        return src_path, size_mb, "original"
+    # MP3 32kbps mono 再エンコード
+    try:
+        audio = AudioSegment.from_file(src_path)
+        audio = audio.set_channels(1).set_frame_rate(16000)
+        mp3_path = os.path.splitext(src_path)[0] + "_uploader.mp3"
+        audio.export(mp3_path, format="mp3", bitrate="32k")
+        size_mb2 = os.path.getsize(mp3_path) / (1024 * 1024)
+        if size_mb2 <= target_mb:
+            return mp3_path, size_mb2, "mp3-32k"
+    except Exception:
+        pass
+    return src_path, size_mb, "too_large"
 
+# ---- WAVを一定秒数で分割（デフォ 10分=600秒）----
+def chunk_wav_by_time(src_wav: str, chunk_sec: int = 600) -> list[str]:
+    audio = AudioSegment.from_file(src_wav)
+    chunks = []
+    base = os.path.splitext(src_wav)[0]
+    total_ms = len(audio)
+    step = chunk_sec * 1000
+    i = 0
+    for start_ms in range(0, total_ms, step):
+        part = audio[start_ms:start_ms + step]
+        out = f"{base}_part{i:03d}.wav"
+        part.export(out, format="wav")
+        chunks.append(out)
+        i += 1
+    return chunks
 
 def format_timestamp(seconds: float) -> str:
     td = timedelta(seconds=float(seconds))
@@ -278,10 +300,8 @@ def format_timestamp(seconds: float) -> str:
     ms = int((td.total_seconds() - total_seconds) * 1000)
     return f"{total_seconds//3600:02d}:{(total_seconds%3600)//60:02d}:{total_seconds%60:02d}.{ms:03d}"
 
-
 def fmt_ts(x: float) -> str:
     return format_timestamp(x) if math.isfinite(x) else "…"
-
 
 # ========== OpenAI で文字起こし ==========
 def _safe_lang(forced_lang: str | None):
@@ -295,8 +315,6 @@ def _safe_lang(forced_lang: str | None):
     return lang
 
 def transcribe_openai(wav_path: str, api_key: str, forced_lang: str | None = None):
-    import os, time
-    from openai import OpenAI
     start = time.time()
     last_err = None
     try:
@@ -306,10 +324,11 @@ def transcribe_openai(wav_path: str, api_key: str, forced_lang: str | None = Non
             raise FileNotFoundError(f"Audio file not found: {wav_path}")
 
         file_size_mb = os.path.getsize(wav_path) / (1024 * 1024)
-        if file_size_mb > 24.5:
-            raise RuntimeError(f"Audio file is too large ({file_size_mb:.1f} MB). Please chunk or compress.")
+        # 50MB まで許可（>50MB は呼び出し側で分割してから渡すため通常到達しない）
+        if file_size_mb > 50.0:
+            raise RuntimeError(f"Audio file is too large ({file_size_mb:.1f} MB). Please split into smaller parts (<50MB).")
 
-        client = OpenAI(api_key=api_key)
+        client = get_openai_client(api_key)
         language = _safe_lang(forced_lang)
 
         with open(wav_path, "rb") as f:
@@ -439,7 +458,6 @@ def extract_slide_keyframes_with_times(video_path: str, out_dir: str, scene_thr:
 
     return [], []
 
-
 def _to_cv2_bgr(image_like):
     # 画像系ライブラリが無ければOCRはスキップ
     if (cv2 is None) or (np is None) or (Image is None):
@@ -468,7 +486,6 @@ def _to_cv2_bgr(image_like):
         return None
     return None
 
-
 def _get_reader():
     """EasyOCR Reader を（あれば）キャッシュして使い回し。"""
     if easyocr is None:
@@ -478,7 +495,6 @@ def _get_reader():
         return easyocr.Reader(['ja', 'en'], gpu=False)
     return _cached_reader()
 
-
 def ocr_slides(image_paths: list) -> list[dict]:
     """
     image_paths: 画像パス/bytes/PIL/ndarray が混在していてもOK
@@ -486,21 +502,17 @@ def ocr_slides(image_paths: list) -> list[dict]:
     """
     if not image_paths:
         return []
-
     if easyocr is None or (cv2 is None) or (np is None) or (Image is None):
         # 依存がなければ空文字で返す（アプリは継続）
         return [{"index": i+1, "path": p, "text": ""} for i, p in enumerate(image_paths)]
-
     reader = _get_reader()
     results = []
     valid_found = False
-
     for idx, src in enumerate(image_paths, start=1):
         img = _to_cv2_bgr(src)
         if img is None or getattr(img, "size", 0) == 0:
             results.append({"index": idx, "path": src, "text": ""})
             continue
-
         valid_found = True
         try:
             lines = reader.readtext(img, detail=0)
@@ -508,12 +520,9 @@ def ocr_slides(image_paths: list) -> list[dict]:
             results.append({"index": idx, "path": src, "text": text})
         except Exception:
             results.append({"index": idx, "path": src, "text": ""})
-
     if not valid_found:
         st.error("OCR用の画像を正しく読み込めませんでした（パス・形式・抽出処理をご確認ください）。")
-
     return results
-
 
 # ========== 整形(生成AIなし) ==========
 def to_verbatim_with_timestamps(segments: List[Tuple[str, float, float]]) -> str:
@@ -523,7 +532,6 @@ def to_verbatim_with_timestamps(segments: List[Tuple[str, float, float]]) -> str
         end_disp   = format_timestamp(e) if math.isfinite(e) else "…"
         lines.append(f"[{start_disp} → {end_disp}] {t}")
     return "\n".join(lines)
-
 
 def heuristic_minutes(segments: List[Tuple[str, float, float]]) -> str:
     block, blocks, char_limit = [], [], 300
@@ -539,12 +547,10 @@ def heuristic_minutes(segments: List[Tuple[str, float, float]]) -> str:
         out.append("")
     return "\n".join(out).strip()
 
-
 def heuristic_abstract(segments: List[Tuple[str, float, float]]) -> str:
     text = " ".join(t for t, _, _ in segments)
     sentences = [s.strip() for s in text.replace("。", "。\n").splitlines() if s.strip()]
     return "【要旨（自動抽出）】\n" + "\n".join(sentences[:6])
-
 
 def heuristic_article_academic(segments: List[Tuple[str, float, float]]) -> str:
     body = " ".join(t for t, _, _ in segments)
@@ -571,7 +577,6 @@ def heuristic_article_academic(segments: List[Tuple[str, float, float]]) -> str:
     ]
     return "\n".join(lines)
 
-
 def heuristic_guideline_commentary(slide_groups: List[Dict[str, Any]], ocr_notes: List[dict]) -> str:
     ocr_map = {o.get("index"): (o.get("text") or "").strip() for o in (ocr_notes or [])}
     lines = [
@@ -591,7 +596,6 @@ def heuristic_guideline_commentary(slide_groups: List[Dict[str, Any]], ocr_notes
         lines.append("")
     lines += ["■ 臨床への含意", "・本改訂により想定される診療上の影響点を要点化。", "", "■ 今後の課題", "・エビデンス強化が必要な論点、運用時の留意点。"]
     return "\n".join(lines).strip()
-
 
 # ========== LLM（記事化/要旨/議事録） ==========
 PURPOSE_PROMPTS = {
@@ -613,7 +617,6 @@ PURPOSE_PROMPTS = {
         "冗長な口語表現は削除し、方言は標準語に直してください。"
     ),
 }
-
 
 def llm_rewrite(kind: str, text: str, api_key: str | None,
                 purpose: str | None = None,
@@ -677,7 +680,6 @@ def llm_rewrite(kind: str, text: str, api_key: str | None,
         result = "【AI整形】\n" + result
     return result
 
-
 def llm_translate_only(text: str, api_key: str | None,
                        source_lang: str | None = None,
                        target_lang: str = "ja") -> str:
@@ -717,7 +719,6 @@ def llm_translate_only(text: str, api_key: str | None,
             return resp["choices"][0]["message"]["content"]
     except Exception as e:
         return f"[LLMエラー] {e}"
-
 
 def llm_article_from_literal(literal_ja: str,
                              api_key: str | None,
@@ -785,7 +786,6 @@ def llm_article_from_literal(literal_ja: str,
     except Exception as e:
         return f"[LLMエラー] {e}"
 
-
 # ========== DOCX 出力 ==========
 def make_docx(title: str, content: str) -> bytes:
     doc = Document()
@@ -805,7 +805,6 @@ def make_docx(title: str, content: str) -> bytes:
     doc.save(buf)
     buf.seek(0)
     return buf.read()
-
 
 # ========== Streamlit UI ==========
 def main():
@@ -831,40 +830,43 @@ def main():
     # ===== サイドバー設定 =====
     with st.sidebar:
         st.header("設定")
-        file_type = st.radio("ファイルタイプ", ["自動判定", "音声", "動画"], index=0)
+        file_type = st.radio("ファイルタイプ", ["自動判定", "音声", "動画"], index=0, key="filetype")
         use_slide_ocr = st.toggle(
             "スライドOCRも併用（動画時）", value=False,
-            help="スライドのキーフレームを抽出しOCRで文字も取り込みます（依存が無ければ空で継続）"
+            help="スライドのキーフレームを抽出しOCRで文字も取り込みます（依存が無ければ空で継続）",
+            key="toggle_ocr"
         )
-        scene_sensitivity = st.slider("シーン変化感度", 0.10, 0.60, 0.35, 0.01)
+        scene_sensitivity = st.slider("シーン変化感度", 0.10, 0.60, 0.35, 0.01, key="scene_thr")
 
         # 出力言語
-        output_lang_label = st.selectbox("出力言語", ["日本語 (JPN)", "English (EN)"], index=0)
+        output_lang_label = st.selectbox("出力言語", ["日本語 (JPN)", "English (EN)"], index=0, key="out_lang")
         output_lang = "ja" if "JPN" in output_lang_label else "en"
 
         # 生成形式
         out_kind = st.selectbox(
             "出力タイプ",
-            ["逐語(タイムスタンプ)", "直訳（日本語化のみ）", "議事録", "要旨", "記事", "ガイドライン解説"]
+            ["逐語(タイムスタンプ)", "直訳（日本語化のみ）", "議事録", "要旨", "記事", "ガイドライン解説"],
+            key="out_kind"
         )
-        purpose = st.selectbox("記事化の目的", ["学会発表", "ガイドライン解説", "ディスカッション"], index=0)
+        purpose = st.selectbox("記事化の目的", ["学会発表", "ガイドライン解説", "ディスカッション"], index=0, key="purpose")
         attach_verbatim = st.toggle(
             "末尾に逐語原文を添付", value=False,
-            help="原文言語の逐語テキストを末尾に付けます（通常はOFF推奨）"
+            help="原文言語の逐語テキストを末尾に付けます（通常はOFF推奨）",
+            key="attach_verbatim"
         )
 
         # LLM整形のON/OFF（APIキーは require_login_and_api で受け取り済み）
-        use_llm = st.toggle("生成AIで整形（任意）", value=False)
+        use_llm = st.toggle("生成AIで整形（任意）", value=False, key="use_llm")
 
         # 音声の言語（Whisperへの指示）
-        speech_lang_label = st.selectbox("音声言語（Whisper）", ["英語", "日本語", "自動"], index=0)
+        speech_lang_label = st.selectbox("音声言語（Whisper）", ["英語", "日本語", "自動"], index=0, key="speech_lang")
         _lang_map = {"英語": "en", "日本語": "ja", "自動": None}
         forced_lang = _lang_map[speech_lang_label]
 
-        # ---- ここから接続テスト（疎通確認）----
+        # ---- 接続テスト ----
         st.divider()
         st.markdown("### 接続テスト")
-        if st.button("🔎 OpenAI 接続テスト"):
+        if st.button("🔎 OpenAI 接続テスト", key="btn_ping"):
             key = (st.session_state.get("api_key") or "").strip()
             if not key:
                 st.error("先に APIキーを入力してください。")
@@ -883,12 +885,32 @@ def main():
                         "NG: OpenAI へ接続/認証できません。ネットワーク or APIキーを確認してください。\n\n"
                         f"詳細: {e}"
                     )
-        # ---- 接続テストここまで ----
+
+        # ---- 10秒サンプルで転写テスト（任意）----
+        st.markdown("### 転写ミニ診断")
+        test_wav = "/mount/src/sample_10s.wav"
+        if not os.path.exists(test_wav):
+            st.caption(f"サンプル音声が見つかりません: {test_wav}（任意。置けばテストできます）")
+        if st.button("🔎 10秒サンプルで転写テスト", key="btn_sample_transcribe"):
+            if not os.path.exists(test_wav):
+                st.error(f"サンプル音声が見つかりません: {test_wav}")
+            else:
+                try:
+                    segs, lang = transcribe_openai(
+                        test_wav,
+                        api_key=api_key,
+                        forced_lang="ja"
+                    )
+                    st.success(f"Sample OK. lang={lang}")
+                    st.write(segs[0]["text"][:500])
+                except Exception as e:
+                    st.error(f"Sample failed: {e}")
 
     # ===== ファイルアップロード =====
     uploaded = st.file_uploader(
         "音声/動画ファイルをアップロード (mp3, m4a, wav, mp4, mov など)",
-        type=["mp3","m4a","wav","mp4","mov","mkv","aac","flac"]
+        type=["mp3","m4a","wav","mp4","mov","mkv","aac","flac"],
+        key="uploader"
     )
     if not uploaded:
         return
@@ -896,39 +918,67 @@ def main():
     st.info(f"受信: {uploaded.name} / {uploaded.size/1024:.1f} KB")
     temp_path = save_uploaded_file_to_temp(uploaded)
     guessed = (uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "")
-    is_video = (file_type == "動画") or (file_type == "自動判定" and guessed.startswith("video/"))
+    is_video = (st.session_state["filetype"] == "動画") or (st.session_state["filetype"] == "自動判定" and guessed.startswith("video/"))
 
     # 変換 → WAV 16kHz mono
     with st.spinner("変換中（WAV 16kHz mono）..."):
         wav_path = ensure_wav(temp_path)
 
-    # 文字起こし（forced_lang を渡す版）
+    # 文字起こし：50MBまで直接。超過は自動で分割
     with st.spinner("🧠 OpenAIで文字起こし中…"):
-        segments, detected_lang = transcribe_openai(
-            wav_path, api_key, forced_lang=forced_lang  # ← 関数側で language=forced_lang を使う
-        )
+        upload_path, up_mb, how = shrink_audio_for_upload(wav_path, target_mb=50.0)
+        if how != "too_large":
+            # そのまま（or mp3化）で1発転写
+            segments, detected_lang = transcribe_openai(
+                upload_path, api_key, forced_lang=forced_lang
+            )
+        else:
+            # >50MB → 分割して連結
+            st.warning(f"音声が {up_mb:.1f}MB と大きいため、10分刻みに分割してから転写します。")
+            parts = chunk_wav_by_time(wav_path, chunk_sec=600)  # 10分
+            segments, detected_lang = [], (forced_lang or "auto")
+            offset = 0.0
+            for i, p in enumerate(parts, start=1):
+                st.caption(f"Part {i}/{len(parts)} を転写中…")
+                segs_i, lang_i = transcribe_openai(p, api_key, forced_lang=forced_lang)
+                try:
+                    d_sec = AudioSegment.from_file(p).duration_seconds
+                except Exception:
+                    d_sec = 0.0
+                txt = " ".join(s.get("text","") for s in segs_i)
+                segments.append({"start": offset, "end": offset + d_sec, "text": txt})
+                offset += d_sec
 
     st.success(f"文字起こし完了。セグメント数: {len(segments)} / 言語検出: {detected_lang}")
 
-    # 逐語（タイムスタンプ付き）原稿
-    verbatim_text = to_verbatim_with_timestamps(segments)
+    # 逐語（タイムスタンプ付き）原稿（簡易：1セグメント合成前提）
+    # 分割転写時は上でstart/endを詰めているので区切りが出ます
+    def _to_triplets(segs_dicts):
+        trips = []
+        for s in segs_dicts:
+            trips.append((s.get("text",""), float(s.get("start", 0.0)), float(s.get("end", 0.0))))
+        return trips
+
+    segments_triplets: List[Tuple[str, float, float]] = _to_triplets(segments)
+    verbatim_text = to_verbatim_with_timestamps(segments_triplets)
     st.session_state["transcript_text"] = verbatim_text
 
     st.subheader("✍️ 逐語テキスト（編集可）")
     st.session_state["transcript_text"] = st.text_area(
         "逐語（必要に応じて修正してください）",
         value=st.session_state["transcript_text"],
-        height=300
+        height=300,
+        key="verbatim_editor"
     )
 
     # スライドOCR（任意）
     slide_groups, slide_notes, slide_digest = [], [], ""
-    if is_video and use_slide_ocr:
+    if is_video and st.session_state["toggle_ocr"]:
         with st.spinner("スライド抽出（キーフレーム+時刻）→ OCR 中..."):
             frames, slide_times = extract_slide_keyframes_with_times(
                 video_path=temp_path,
                 out_dir=os.path.join(st.session_state["workdir"], "slides"),
-                scene_thr=scene_sensitivity,
+                scene_thr=st.session_state["scene_thr"],
             )
 
             st.write(f"抽出フレーム枚数: {len(frames)} / 切替検出: {len(slide_times)}")
@@ -942,7 +992,7 @@ def main():
                 st.warning("抽出された画像が0枚です。フォールバックが効いていない可能性があります。")
 
             slide_notes = ocr_slides(frames)
-            slide_groups = group_segments_by_slides(segments, slide_times)
+            slide_groups = group_segments_by_slides(segments_triplets, slide_times)
             slide_digest = "\n\n".join(
                 [f"[Slide {s['index']}]\n{s.get('text','')}" for s in slide_notes if s.get('text','').strip()]
             )
@@ -951,7 +1001,7 @@ def main():
     edited_transcript = st.session_state["transcript_text"]
     cleaned_for_llm = strip_timestamps(edited_transcript)
 
-    if out_kind == "ガイドライン解説" and slide_groups:
+    if st.session_state["out_kind"] == "ガイドライン解説" and slide_groups:
         chunks = []
         for g in slide_groups:
             idx = g["index"]
@@ -972,39 +1022,46 @@ def main():
         )
 
     # 既定（ヒューリスティック）出力
+    out_kind = st.session_state["out_kind"]
     if out_kind == "逐語(タイムスタンプ)":
-        base_out = to_verbatim_with_timestamps(segments); kind_key = "verbatim"
+        base_out = to_verbatim_with_timestamps(segments_triplets); kind_key = "verbatim"
     elif out_kind == "議事録":
-        base_out = heuristic_minutes(segments); kind_key = "minutes"
+        base_out = heuristic_minutes(segments_triplets); kind_key = "minutes"
     elif out_kind == "要旨":
-        base_out = heuristic_abstract(segments); kind_key = "abstract"
+        base_out = heuristic_abstract(segments_triplets); kind_key = "abstract"
     elif out_kind == "ガイドライン解説":
         base_out = heuristic_guideline_commentary(slide_groups, slide_notes) if slide_groups else \
-                   "【ガイドライン解説（簡易）】\n" + heuristic_article_academic(segments)
+                   "【ガイドライン解説（簡易）】\n" + heuristic_article_academic(segments_triplets)
         kind_key = "article"
     else:
-        base_out = heuristic_article_academic(segments); kind_key = "article"
+        base_out = heuristic_article_academic(segments_triplets); kind_key = "article"
 
     final_out = base_out
 
-  # ----- ここから置き換え（ボタン＋自動実行） -----
+    # ----- 生成AIで整形 -----
     st.markdown("---")
     st.subheader("🧠 生成AIで整形する")
     label_lang = "日本語" if output_lang == "ja" else "English"
-    
-    # 生成AIトグルONなら自動実行。OFFならボタンで実行。
-    auto_generate = use_llm
-    clicked = st.button(f"✨ 生成AIで整形（{label_lang}で出力）")
-    
+
+    auto_generate = st.session_state["use_llm"]
+    clicked = st.button(f"✨ 生成AIで整形（{label_lang}で出力）", key="btn_gen")
     do_generate = auto_generate or clicked
+
     if not do_generate:
-        st.text_area("結果テキスト", value=final_out or "", height=400)
+        st.text_area("結果テキスト", value=final_out or "", height=400, key="no_gen_area")
+        # ダウンロードだけは提供
+        st.download_button("TXTダウンロード", data=final_out.encode("utf-8"), file_name="output.txt", key="dl_txt_nogen")
+        docx_bytes = make_docx(title=f"{out_kind}（{purpose}）", content=final_out)
+        st.download_button("DOCXダウンロード", data=docx_bytes, file_name="output.docx", key="dl_docx_nogen")
         return
-# ----- 置き換えここまで -----
+
     # 押下後
-    if use_llm is False:
+    if not st.session_state["use_llm"]:
         st.info("生成AIがOFFのため、ヒューリスティック整形の結果を表示します。")
-        st.text_area("結果テキスト", value=final_out or "", height=400)
+        st.text_area("結果テキスト", value=final_out or "", height=400, key="gen_off_area")
+        st.download_button("TXTダウンロード", data=final_out.encode("utf-8"), file_name="output.txt", key="dl_txt_off")
+        docx_bytes = make_docx(title=f"{out_kind}（{purpose}）", content=final_out)
+        st.download_button("DOCXダウンロード", data=docx_bytes, file_name="output.docx", key="dl_docx_off")
         return
 
     if not api_key:
@@ -1026,7 +1083,7 @@ def main():
                     target_lang=output_lang,
                 )
         elif out_kind == "直訳（日本語化のみ）":
-            with st.spinner("英語→日本語 直訳中..."):
+            with st.spinner("直訳中..."):
                 final_out = llm_translate_only(
                     text=cleaned_for_llm,
                     api_key=api_key,
@@ -1075,10 +1132,10 @@ def main():
 
     # ===== 三段表示 =====
     st.subheader("📝 原文（変更前・英語／タイムスタンプ除去）")
-    st.text_area("原文", value=cleaned_for_llm, height=260)
+    st.text_area("原文", value=cleaned_for_llm, height=260, key="orig_area")
 
     st.subheader("🇯🇵 英語→日本語（直訳・整形なし）")
-    if use_llm and api_key:
+    if st.session_state["use_llm"] and api_key:
         cached_literal = st.session_state.get("ja_literal_for_article")
         if cached_literal:
             ja_literal = cached_literal
@@ -1090,20 +1147,20 @@ def main():
                     source_lang=detected_lang,
                     target_lang="ja",
                 )
-        st.text_area("直訳", value=ja_literal, height=260)
+        st.text_area("直訳", value=ja_literal, height=260, key="literal_area")
     else:
-        st.text_area("直訳", value="(生成AIがOFFまたはAPIキー未入力のため直訳は表示できません)", height=260)
+        st.text_area("直訳", value="(生成AIがOFFまたはAPIキー未入力のため直訳は表示できません)", height=260, key="literal_off")
 
     st.subheader("📄 整形結果プレビュー")
     if out_kind == "ガイドライン解説" and output_lang == "ja" and final_out:
         for _p in ["背景", "改訂ポイント", "推奨度・エビデンス", "臨床への影響", "課題", "今後"]:
             final_out = re.sub(rf"(#+\s*{_p}\s*\n)(\s*\1)+", r"\1", final_out)
-    st.text_area("整形結果", value=final_out, height=380)
+    st.text_area("整形結果", value=final_out, height=380, key="final_area")
 
-    st.download_button("TXTダウンロード", data=final_out.encode("utf-8"), file_name="output.txt")
+    st.download_button("TXTダウンロード", data=final_out.encode("utf-8"), file_name="output.txt", key="dl_txt")
     docx_bytes = make_docx(title=f"{out_kind}（{purpose}）", content=final_out)
-    st.download_button("DOCXダウンロード", data=docx_bytes, file_name="output.docx")
+    st.download_button("DOCXダウンロード", data=docx_bytes, file_name="output.docx", key="dl_docx")
 
 if __name__ == "__main__":
-    
     main()
+
