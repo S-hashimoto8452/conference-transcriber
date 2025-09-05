@@ -799,12 +799,15 @@ def main():
     st.set_page_config(page_title="InsighTCROSS® Smart Writer v11", layout="wide")
 
     # 1) ログイン＆APIキー入力（毎回）
-    api_key = require_login_and_api()
+    api_key = require_login_and_api()  # ← ここで毎回パスワード＆APIキーを入力
+    st.session_state["api_key"] = api_key  # 接続テスト用に保持
 
+    # 作業フォルダ
     if "workdir" not in st.session_state:
         st.session_state["workdir"] = os.path.abspath("./.work")
         os.makedirs(st.session_state["workdir"], exist_ok=True)
 
+    # タイトル等
     st.title("InsighTCROSS® Smart Writer v11")
     if "transcript_text" not in st.session_state:
         st.session_state["transcript_text"] = ""
@@ -812,35 +815,68 @@ def main():
         st.session_state["generated_text"] = ""
     st.write("音声/動画をアップロードして、逐語・直訳・議事録・要旨・記事に整形。動画はスライドOCR併用も可能。")
 
+    # ===== サイドバー設定 =====
     with st.sidebar:
         st.header("設定")
         file_type = st.radio("ファイルタイプ", ["自動判定", "音声", "動画"], index=0)
-        use_slide_ocr = st.toggle("スライドOCRも併用（動画時）", value=False,
-                                  help="スライドのキーフレームを抽出しOCRで文字も取り込みます（依存が無ければ空で継続）")
+        use_slide_ocr = st.toggle(
+            "スライドOCRも併用（動画時）", value=False,
+            help="スライドのキーフレームを抽出しOCRで文字も取り込みます（依存が無ければ空で継続）"
+        )
         scene_sensitivity = st.slider("シーン変化感度", 0.10, 0.60, 0.35, 0.01)
 
+        # 出力言語
         output_lang_label = st.selectbox("出力言語", ["日本語 (JPN)", "English (EN)"], index=0)
         output_lang = "ja" if "JPN" in output_lang_label else "en"
 
+        # 生成形式
         out_kind = st.selectbox(
             "出力タイプ",
             ["逐語(タイムスタンプ)", "直訳（日本語化のみ）", "議事録", "要旨", "記事", "ガイドライン解説"]
         )
         purpose = st.selectbox("記事化の目的", ["学会発表", "ガイドライン解説", "ディスカッション"], index=0)
-        attach_verbatim = st.toggle("末尾に逐語原文を添付", value=False,
-                                    help="原文言語の逐語テキストを末尾に付けます（通常はOFF推奨）")
+        attach_verbatim = st.toggle(
+            "末尾に逐語原文を添付", value=False,
+            help="原文言語の逐語テキストを末尾に付けます（通常はOFF推奨）"
+        )
+
+        # LLM整形のON/OFF（APIキーは require_login_and_api で受け取り済み）
         use_llm = st.toggle("生成AIで整形（任意）", value=False)
+
         # 音声の言語（Whisperへの指示）
         speech_lang_label = st.selectbox("音声言語（Whisper）", ["英語", "日本語", "自動"], index=0)
         _lang_map = {"英語": "en", "日本語": "ja", "自動": None}
         forced_lang = _lang_map[speech_lang_label]
 
+        # ---- ここから接続テスト（疎通確認）----
+        st.divider()
+        st.markdown("### 接続テスト")
+        if st.button("🔎 OpenAI 接続テスト"):
+            key = (st.session_state.get("api_key") or "").strip()
+            if not key:
+                st.error("先に APIキーを入力してください。")
+            else:
+                try:
+                    c = get_openai_client(key)
+                    _ = c.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": "ping"}],
+                        max_tokens=5,
+                        temperature=0.0,
+                    )
+                    st.success("OK: OpenAI へ到達できました。")
+                except Exception as e:
+                    st.error(
+                        "NG: OpenAI へ接続/認証できません。ネットワーク or APIキーを確認してください。\n\n"
+                        f"詳細: {e}"
+                    )
+        # ---- 接続テストここまで ----
 
+    # ===== ファイルアップロード =====
     uploaded = st.file_uploader(
         "音声/動画ファイルをアップロード (mp3, m4a, wav, mp4, mov など)",
         type=["mp3","m4a","wav","mp4","mov","mkv","aac","flac"]
     )
-
     if not uploaded:
         return
 
@@ -849,11 +885,15 @@ def main():
     guessed = (uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "")
     is_video = (file_type == "動画") or (file_type == "自動判定" and guessed.startswith("video/"))
 
+    # 変換 → WAV 16kHz mono
     with st.spinner("変換中（WAV 16kHz mono）..."):
         wav_path = ensure_wav(temp_path)
 
+    # 文字起こし（forced_lang を渡す版）
     with st.spinner("🧠 OpenAIで文字起こし中…"):
-        segments, detected_lang = transcribe_openai(wav_path, api_key, forced_lang=forced_lang)
+        segments, detected_lang = transcribe_openai(
+            wav_path, api_key, forced_lang=forced_lang  # ← 関数側で language=forced_lang を使う
+        )
 
     st.success(f"文字起こし完了。セグメント数: {len(segments)} / 言語検出: {detected_lang}")
 
