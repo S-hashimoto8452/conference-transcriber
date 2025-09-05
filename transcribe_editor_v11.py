@@ -219,15 +219,51 @@ def save_uploaded_file_to_temp(uploaded_file) -> str:
 
 
 def ensure_wav(input_path: str) -> str:
+    """アップロードされたファイルを 16kHz/mono の WAV に変換。
+       pydub→失敗時は ffmpeg CLI にフォールバック。"""
+    wav_path = os.path.splitext(input_path)[0] + "_16k.wav"
+
+    # 1) まずは pydub で普通に読む
     try:
         audio = AudioSegment.from_file(input_path)
-    except Exception as e:
+        audio = audio.set_channels(1).set_frame_rate(16000)
+        audio.export(wav_path, format="wav")
+        return wav_path
+    except Exception as e1:
+        pass  # フォールバックへ
+
+    # 2) フォールバック: ffmpeg CLI で “修復→音声抽出”
+    ff = shutil.which("ffmpeg") or "ffmpeg"
+
+    # 2-1) moov 位置の問題を回避（コピーリマックス）
+    fixed_mp4 = os.path.splitext(input_path)[0] + "_fixed.mp4"
+    try:
+        p1 = subprocess.run(
+            [ff, "-y", "-v", "error", "-i", input_path, "-c", "copy", "-movflags", "+faststart", fixed_mp4],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore"
+        )
+        # リマックスに失敗しても続行（元を使う）
+        src_for_audio = fixed_mp4 if os.path.exists(fixed_mp4) and p1.returncode == 0 else input_path
+
+        # 2-2) 音声だけ取り出して WAV 化
+        p2 = subprocess.run(
+            [ff, "-y", "-v", "error", "-i", src_for_audio,
+             "-vn", "-ac", "1", "-ar", "16000", "-map", "0:a:0?",
+             "-c:a", "pcm_s16le", wav_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore"
+        )
+        if p2.returncode == 0 and os.path.exists(wav_path):
+            return wav_path
+        raise RuntimeError(p2.stderr or "ffmpeg failed")
+    except Exception as e2:
         st.error(
             "音声/動画の読み込みに失敗しました。\n"
-            "ffmpeg/ffprobe が実行可能か、PATH/コード設定が正しいか確認してください。\n\n"
-            f"詳細: {e}"
+            "ファイルが壊れているかアップロードが途中で切れた可能性があります。\n"
+            "（小さめのファイルで再アップロード、あるいは mp3/m4a でのアップをお試しください）\n\n"
+            f"詳細: {e2}"
         )
         st.stop()
+
     audio = audio.set_channels(1).set_frame_rate(16000)
     wav_path = os.path.splitext(input_path)[0] + "_16k.wav"
     audio.export(wav_path, format="wav")
