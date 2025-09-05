@@ -246,19 +246,19 @@ def fmt_ts(x: float) -> str:
 
 
 # ========== OpenAI で文字起こし ==========
-def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, float, float]], str | None]:
+# ========== OpenAI で文字起こし ==========
+def transcribe_openai(
+    wav_path: str,
+    api_key: str,
+    forced_lang: str | None = None
+) -> tuple[list[tuple[str, float, float]], str | None]:
     """OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。"""
-
-    # デバッグ：環境変数に何が入っているか確認（機密は含まない）
-    st.caption(f"DEBUG OPENAI_BASE_URL={os.environ.get('OPENAI_BASE_URL')!r}")
-
-    # ✅ 公式の OpenAI エンドポイントを明示指定して初期化（環境変数の影響を受けない）
+    # 公式の OpenAI エンドポイントを明示（環境変数の影響を受けない）
     client = OpenAI(api_key=api_key, base_url="https://api.openai.com/v1")
-    st.caption("DEBUG: OpenAI(api_key, official base_url) で初期化")
 
-    # 環境変数でモデルが指定されていれば優先。なければ whisper-1 を使用
+    # モデルは環境変数で上書き可。未指定は whisper-1
     candidates = [os.environ.get("OPENAI_TRANSCRIBE_MODEL") or "", "whisper-1"]
-    candidates = [m for m in candidates if m]  # 空文字を除去
+    candidates = [m for m in candidates if m]
 
     last_err = None
     with open(wav_path, "rb") as f:
@@ -266,11 +266,17 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
         for m in candidates:
             try:
                 f.seek(0)
-                resp = client.audio.transcriptions.create(
-                    model=m,
-                    file=f,
-                    response_format="verbose_json",
-                )
+                kwargs = {
+                    "model": m,
+                    "file": f,
+                    "response_format": "verbose_json",
+                }
+                # ★ 言語を強制指定（英語/日本語/自動）
+                if forced_lang:
+                    kwargs["language"] = forced_lang
+
+                resp = client.audio.transcriptions.create(**kwargs)
+
                 text = getattr(resp, "text", "") or ""
                 segs = []
                 seg_attr = getattr(resp, "segments", None)
@@ -287,7 +293,9 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
                         segs.append((t, stt, endt))
                 else:
                     segs = [(text, float("nan"), float("nan"))]
-                detected = getattr(resp, "language", None)
+
+                # 表示用の検出言語。強制した場合はそのコードを採用
+                detected = forced_lang or getattr(resp, "language", None)
                 return segs, detected
             except Exception as e:
                 last_err = e
@@ -296,9 +304,12 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
         try:
             f.seek(0)
             fallback_model = candidates[-1] if candidates else "whisper-1"
-            resp = client.audio.transcriptions.create(model=fallback_model, file=f)
+            kwargs = {"model": fallback_model, "file": f}
+            if forced_lang:
+                kwargs["language"] = forced_lang
+            resp = client.audio.transcriptions.create(**kwargs)
             text = getattr(resp, "text", "") or ""
-            return [(text, float("nan"), float("nan"))], None
+            return [(text, float("nan"), float("nan"))], forced_lang or None
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {last_err or e}")
 
@@ -783,6 +794,11 @@ def main():
         attach_verbatim = st.toggle("末尾に逐語原文を添付", value=False,
                                     help="原文言語の逐語テキストを末尾に付けます（通常はOFF推奨）")
         use_llm = st.toggle("生成AIで整形（任意）", value=False)
+        # 音声の言語（Whisperへの指示）
+        speech_lang_label = st.selectbox("音声言語（Whisper）", ["英語", "日本語", "自動"], index=0)
+        _lang_map = {"英語": "en", "日本語": "ja", "自動": None}
+        forced_lang = _lang_map[speech_lang_label]
+
 
     uploaded = st.file_uploader(
         "音声/動画ファイルをアップロード (mp3, m4a, wav, mp4, mov など)",
@@ -801,7 +817,7 @@ def main():
         wav_path = ensure_wav(temp_path)
 
     with st.spinner("🧠 OpenAIで文字起こし中…"):
-        segments, detected_lang = transcribe_openai(wav_path, api_key)
+        segments, detected_lang = transcribe_openai(wav_path, api_key, forced_lang=forced_lang)
 
     st.success(f"文字起こし完了。セグメント数: {len(segments)} / 言語検出: {detected_lang}")
 
