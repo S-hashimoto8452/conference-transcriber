@@ -1,0 +1,5 @@
+﻿openai==1.40.6
+streamlit==1.36.0
+python-dotenv==1.0.1
+tiktoken==0.7.0
+faster-whisper==1.0.3
