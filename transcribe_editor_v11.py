@@ -778,11 +778,13 @@ def main():
     is_video = (file_type == "動画") or (file_type == "自動判定" and guessed.startswith("video/"))
 
     with st.spinner("変換中（WAV 16kHz mono）..."):
-        wav_path = ensure_wav(temp_path)
-    segments, detected_lang = transcribe_openai(wav_path)
+    wav_path = ensure_wav(temp_path)
 
-    )
+    with st.spinner("🧠 OpenAIで文字起こし中…"):
+        segments, detected_lang = transcribe_openai(wav_path)
+
     st.success(f"文字起こし完了。セグメント数: {len(segments)} / 言語検出: {detected_lang}")
+
 
     # 逐語（タイムスタンプ付き）原稿
     verbatim_text = to_verbatim_with_timestamps(segments)
