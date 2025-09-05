@@ -71,33 +71,64 @@ def require_login_and_api() -> str:
     with st.sidebar:
         st.header("🔐 アクセス")
 
-        # 初回（まだ共通パスが未設定） → 管理者の初期セットアップ
+        # ⚙️ 管理者リセット（任意）
+        with st.expander("⚙️ 管理者メニュー（リセット）"):
+            reset_token = st.text_input("RESET と入力して有効化", key="reset_token")
+            if st.button("初期セットアップをやり直す"):
+                if reset_token.strip().upper() != "RESET":
+                    st.warning("RESET と入力してください。")
+                else:
+                    cfg["common_password"] = None
+                    cfg["default_api_key"] = None
+                    st.session_state.clear()
+                    try:
+                        st.rerun()
+                    except Exception:
+                        try:
+                            st.experimental_rerun()
+                        except Exception:
+                            pass
+
+        # ── 初回セットアップ：共通パスワードのみ設定（APIキーは保存しない）
         if not cfg["common_password"]:
-            st.info("初回セットアップ：共通パスワードと（任意で）既定のOpenAI APIキーを設定してください。")
+            st.info("初回セットアップ：共通パスワードのみ設定（APIキーは保存しません）")
             new_pw = st.text_input("共通パスワード（必須）", type="password")
-            new_key = st.text_input("既定の OpenAI APIキー（任意）", type="password",
-                                    help="空のままでもOK。各ユーザーが毎回入力できます。")
             if st.button("保存"):
                 if not new_pw:
                     st.error("共通パスワードは必須です。")
                 else:
                     cfg["common_password"] = new_pw
-                    cfg["default_api_key"] = new_key or None
+                    cfg["default_api_key"] = None
                     st.success("セットアップ完了。以降はこのパスワードでログインできます。")
-                    st.experimental_rerun()
+                    try:
+                        st.rerun()
+                    except Exception:
+                        try:
+                            st.experimental_rerun()
+                        except Exception:
+                            pass
             st.stop()
 
-        # 通常ログイン（全ユーザー）
+        # ── 通常ログイン：毎回 パスワード＋APIキー を入力
         pw = st.text_input("共通パスワードを入力", type="password")
-        user_key = st.text_input("OpenAI APIキー（未入力なら既定を使用）", type="password")
+        user_key = st.text_input("OpenAI APIキー（必須）", type="password")
 
         if st.button("ログイン"):
             if pw != cfg["common_password"]:
                 st.error("パスワードが違います。")
                 st.stop()
+            if not user_key.strip():
+                st.error("OpenAI APIキーは必須です。")
+                st.stop()
             st.session_state["auth_ok"] = True
-            st.session_state["user_api_key"] = user_key.strip() or (cfg["default_api_key"] or "")
-            st.experimental_rerun()
+            st.session_state["user_api_key"] = user_key.strip()
+            try:
+                st.rerun()
+            except Exception:
+                try:
+                    st.experimental_rerun()
+                except Exception:
+                    pass
 
         if not st.session_state.get("auth_ok"):
             st.stop()
@@ -107,8 +138,6 @@ def require_login_and_api() -> str:
         st.error("OpenAI APIキーが未入力です。サイドバーに入力してください。")
         st.stop()
     return api_key
-
-
 # ========== OpenAI クライアント生成 ==========
 def get_openai_client(api_key: str) -> OpenAI:
     base = os.environ.get("OPENAI_BASE_URL")  # Azureを使うなら環境変数でベースURLを指定
