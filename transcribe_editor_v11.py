@@ -248,9 +248,13 @@ def fmt_ts(x: float) -> str:
 # ========== OpenAI で文字起こし ==========
 def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, float, float]], str | None]:
     """OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。"""
-    # ✅ ヘルパーを使わず、base_url を絶対に渡さない
-    client = OpenAI(api_key=api_key)
-    st.caption("DEBUG: OpenAI(api_key) で初期化（base_url は未使用）")
+
+    # デバッグ：環境変数に何が入っているか確認（機密は含まない）
+    st.caption(f"DEBUG OPENAI_BASE_URL={os.environ.get('OPENAI_BASE_URL')!r}")
+
+    # ✅ 公式の OpenAI エンドポイントを明示指定して初期化（環境変数の影響を受けない）
+    client = OpenAI(api_key=api_key, base_url="https://api.openai.com/v1")
+    st.caption("DEBUG: OpenAI(api_key, official base_url) で初期化")
 
     # 環境変数でモデルが指定されていれば優先。なければ whisper-1 を使用
     candidates = [os.environ.get("OPENAI_TRANSCRIBE_MODEL") or "", "whisper-1"]
