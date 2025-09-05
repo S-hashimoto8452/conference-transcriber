@@ -1,13 +1,12 @@
-# transcribe_editor_v8.py
+# transcribe_editor_v11.py
 # -------------------------------------------------------------
 # 機能:
-# 1) 音声/動画アップロード → Whisper系(faster-whisper)で文字起こし
+# 1) 音声/動画アップロード → OpenAIで文字起こし
 # 2) 出力選択: 逐語(タイムスタンプ) / 直訳（日本語化のみ）/ 議事録 / 要旨 / 記事 / ガイドライン解説
 # 3) 目的選択: 学会発表 / ガイドライン解説 / ディスカッション（LLM整形に反映）
-# 4) 動画オプション: スライドOCR(キーフレーム抽出 + OCR) 併用の可否
-# 5) 生成AIは任意。APIキー未入力でもヒューリスティック整形で動作
-# 6) TXT/DOCXでダウンロード可能
-# 7) 生成AIで整形（日本語）→ 上から「原文英語／直訳／整形結果」の三段表示
+# 4) 動画オプション: スライドOCR(キーフレーム抽出 + OCR) 併用の可否（依存が無ければ自動でスキップ）
+# 5) TXT/DOCXでダウンロード可能
+# 6) サイドバーで毎回「共通パスワード」と「OpenAI APIキー」を入力（Secrets不要）
 # -------------------------------------------------------------
 
 import os
@@ -21,66 +20,102 @@ from datetime import timedelta
 import re
 from typing import List, Tuple, Dict, Any
 
+import math
+from pathlib import Path
+
 import streamlit as st
 from pydub import AudioSegment
 from pydub.utils import which
 from docx import Document
 from docx.shared import Pt
+
+# OpenAI SDK（v1）
 from openai import OpenAI
 
-# 任意: OpenAI
+# （LLMの整形に chat.completions を使うための互換ハンドル）
 try:
     import openai as openai_mod  # pip install openai
 except Exception:
     openai_mod = None
 
-# 任意: スライドOCR（easyocr）
+# EasyOCR はオプション（未インストールでも落ちないように）
 try:
     import easyocr  # pip install easyocr
 except Exception:
     easyocr = None
 
-import math
-from pathlib import Path
+# 画像系ライブラリは遅延・任意（未インストールを許容）
+try:
+    import numpy as np
+    import cv2
+    from PIL import Image
+except Exception:
+    np = None
+    cv2 = None
+    Image = None
 
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url=os.environ.get("OPENAI_BASE_URL")  # 通常のOpenAIなら未設定でOK
-)
 
-# 🔐 パスワード認証用関数
-def require_password():
-    """共通パスワードで簡易ログイン。通過しない限りアプリ本体を表示しない。"""
-    if st.session_state.get("auth_ok", False):
-        # ログアウトボタン（任意）
-        with st.sidebar:
-            if st.button("🔒 ログアウト"):
-                st.session_state.clear()
-                st.experimental_rerun()
-        return
+# ========== ランタイム共通ストア（起動中のみ保持。毎回の起動時に設定し直し） ==========
+@st.cache_resource(show_spinner=False)
+def runtime_config():
+    return {
+        "common_password": None,   # 初回セットアップで管理者が設定
+        "default_api_key": None,   # 任意：既定のAPIキー。未設定なら各ユーザーが毎回入力
+    }
+
+
+# ========== ログイン＆APIキー取得（毎回サイドバーで入力） ==========
+def require_login_and_api() -> str:
+    cfg = runtime_config()
 
     with st.sidebar:
-        st.header("社内ログイン")
-        pw = st.text_input("パスワード", type="password", help="社内共通パスワードを入力")
-        submitted = st.button("ログイン")
+        st.header("🔐 アクセス")
 
-    correct = st.secrets.get("APP_PASSWORD", None)
+        # 初回（まだ共通パスが未設定） → 管理者の初期セットアップ
+        if not cfg["common_password"]:
+            st.info("初回セットアップ：共通パスワードと（任意で）既定のOpenAI APIキーを設定してください。")
+            new_pw = st.text_input("共通パスワード（必須）", type="password")
+            new_key = st.text_input("既定の OpenAI APIキー（任意）", type="password",
+                                    help="空のままでもOK。各ユーザーが毎回入力できます。")
+            if st.button("保存"):
+                if not new_pw:
+                    st.error("共通パスワードは必須です。")
+                else:
+                    cfg["common_password"] = new_pw
+                    cfg["default_api_key"] = new_key or None
+                    st.success("セットアップ完了。以降はこのパスワードでログインできます。")
+                    st.experimental_rerun()
+            st.stop()
 
-    if submitted:
-        if correct is None:
-            st.error("APP_PASSWORD が未設定です。.streamlit/secrets.toml を確認してください。")
-        elif pw == correct:
+        # 通常ログイン（全ユーザー）
+        pw = st.text_input("共通パスワードを入力", type="password")
+        user_key = st.text_input("OpenAI APIキー（未入力なら既定を使用）", type="password")
+
+        if st.button("ログイン"):
+            if pw != cfg["common_password"]:
+                st.error("パスワードが違います。")
+                st.stop()
             st.session_state["auth_ok"] = True
-            st.success("ログイン成功")
+            st.session_state["user_api_key"] = user_key.strip() or (cfg["default_api_key"] or "")
             st.experimental_rerun()
-        else:
-            st.error("パスワードが違います。")
 
-    if not st.session_state.get("auth_ok", False):
+        if not st.session_state.get("auth_ok"):
+            st.stop()
+
+    api_key = st.session_state.get("user_api_key", "")
+    if not api_key:
+        st.error("OpenAI APIキーが未入力です。サイドバーに入力してください。")
         st.stop()
-    
-# ---------------------- ユーティリティ ----------------------
+    return api_key
 
+
+# ========== OpenAI クライアント生成 ==========
+def get_openai_client(api_key: str) -> OpenAI:
+    base = os.environ.get("OPENAI_BASE_URL")  # Azureを使うなら環境変数でベースURLを指定
+    return OpenAI(api_key=api_key, base_url=base)
+
+
+# ========== 文字ユーティリティ ==========
 def split_text_by_chars(text: str, chunk_size: int = 6000, overlap: int = 300) -> list[str]:
     text = text.strip()
     if len(text) <= chunk_size:
@@ -110,7 +145,7 @@ def strip_timestamps(text: str) -> str:
     return pattern.sub("", text).strip()
 
 
-# ====================== FFmpeg/ffprobe の明示設定 ======================
+# ========== FFmpeg/ffprobe 検出（Cloudでは packages.txt: ffmpeg でOK） ==========
 PROJECT_DIR = Path(__file__).parent
 FFBIN_CANDIDATES = [
     PROJECT_DIR / "ffmpeg-7.0.2-essentials_build" / "bin",
@@ -143,9 +178,9 @@ else:
     if ffprobe_found:
         FFPROBE_EXE = Path(ffprobe_found)
         AudioSegment.ffprobe = ffprobe_found
-# ======================================================================
 
 
+# ========== I/O ユーティリティ ==========
 def save_uploaded_file_to_temp(uploaded_file) -> str:
     suffix = os.path.splitext(uploaded_file.name)[1]
     tmp_path = os.path.join(st.session_state["workdir"], f"upload_{int(time.time())}{suffix}")
@@ -176,11 +211,18 @@ def format_timestamp(seconds: float) -> str:
     ms = int((td.total_seconds() - total_seconds) * 1000)
     return f"{total_seconds//3600:02d}:{(total_seconds%3600)//60:02d}:{total_seconds%60:02d}.{ms:03d}"
 
-def transcribe_openai(wav_path: str) -> tuple[list[tuple[str, float, float]], str | None]:
+
+def fmt_ts(x: float) -> str:
+    return format_timestamp(x) if math.isfinite(x) else "…"
+
+
+# ========== OpenAI で文字起こし ==========
+def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, float, float]], str | None]:
     """
     OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。
     戻り値: [(text, start, end), ...], detected_language(or None)
     """
+    client = get_openai_client(api_key)
     prefer = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
     candidates = [prefer, "whisper-1"]
 
@@ -214,17 +256,13 @@ def transcribe_openai(wav_path: str) -> tuple[list[tuple[str, float, float]], st
         # 2) フォールバック：テキストのみ
         f.seek(0)
         try:
-            resp = client.audio.transcriptions.create(model=candidates[-1], file=f)
+            resp = client.audio.transcriptions.create(model="whisper-1", file=f)
             return [(resp.text, float("nan"), float("nan"))], None
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {last_err or e}")
 
-def fmt_ts(x: float) -> str:
-    return format_timestamp(x) if math.isfinite(x) else "…"
 
-
-# ---------------------- スライドと発話の対応付け ----------------------
-
+# ========== スライドと発話の対応付け ==========
 def group_segments_by_slides(
     segments: List[Tuple[str, float, float]],
     slide_change_times: List[float]
@@ -242,7 +280,7 @@ def group_segments_by_slides(
     return grouped
 
 
-# ---------------------- スライド抽出 & OCR ----------------------
+# ========== スライド抽出 & OCR ==========
 def extract_slide_keyframes_with_times(video_path: str, out_dir: str, scene_thr: float=0.35) -> tuple[list[str], list[float]]:
     os.makedirs(out_dir, exist_ok=True)
     for p in glob.glob(os.path.join(out_dir, "*.jpg")):
@@ -285,7 +323,7 @@ def extract_slide_keyframes_with_times(video_path: str, out_dir: str, scene_thr:
         "-vsync", "vfr",
         os.path.join(out_dir, "%04d.jpg"),
     ]
-    proc_fb = subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore")
+    subprocess.run(cmd_fb, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore")
 
     image_paths = sorted(glob.glob(os.path.join(out_dir, "*.jpg")))
     if image_paths:
@@ -302,31 +340,27 @@ def extract_slide_keyframes_with_times(video_path: str, out_dir: str, scene_thr:
 
     return [], []
 
-# 先頭付近（import の近く）に必要なら追加
-import numpy as np
-import cv2
-from PIL import Image
 
 def _to_cv2_bgr(image_like):
+    # 画像系ライブラリが無ければOCRはスキップ
+    if (cv2 is None) or (np is None) or (Image is None):
+        return None
     try:
         if isinstance(image_like, (bytes, bytearray)):
             arr = np.frombuffer(image_like, np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             return img
-
         if isinstance(image_like, str):
             img = cv2.imread(image_like, cv2.IMREAD_COLOR)
-            if img is None:  # ← 日本語パス等で失敗するケースに対応
+            if img is None:
                 try:
                     pil = Image.open(image_like).convert("RGB")
                     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
                 except Exception:
                     return None
             return img
-
         if isinstance(image_like, Image.Image):
             return cv2.cvtColor(np.array(image_like), cv2.COLOR_RGB2BGR)
-
         if isinstance(image_like, np.ndarray):
             if image_like.ndim == 2:
                 return cv2.cvtColor(image_like, cv2.COLOR_GRAY2BGR)
@@ -335,16 +369,16 @@ def _to_cv2_bgr(image_like):
         return None
     return None
 
+
 def _get_reader():
     """EasyOCR Reader を（あれば）キャッシュして使い回し。"""
-    try:
-        import streamlit as st
-        @st.cache_resource(show_spinner=False)
-        def _cached_reader():
-            return easyocr.Reader(['ja', 'en'], gpu=False)
-        return _cached_reader()
-    except Exception:
+    if easyocr is None:
+        return None
+    @st.cache_resource(show_spinner=False)
+    def _cached_reader():
         return easyocr.Reader(['ja', 'en'], gpu=False)
+    return _cached_reader()
+
 
 def ocr_slides(image_paths: list) -> list[dict]:
     """
@@ -354,8 +388,8 @@ def ocr_slides(image_paths: list) -> list[dict]:
     if not image_paths:
         return []
 
-    if easyocr is None:
-        # EasyOCR が無い環境でも落ちないように空文字で返す
+    if easyocr is None or (cv2 is None) or (np is None) or (Image is None):
+        # 依存がなければ空文字で返す（アプリは継続）
         return [{"index": i+1, "path": p, "text": ""} for i, p in enumerate(image_paths)]
 
     reader = _get_reader()
@@ -365,32 +399,24 @@ def ocr_slides(image_paths: list) -> list[dict]:
     for idx, src in enumerate(image_paths, start=1):
         img = _to_cv2_bgr(src)
         if img is None or getattr(img, "size", 0) == 0:
-            # 画像化できなかった場合でも空文字でレコードを返す（落とさない）
             results.append({"index": idx, "path": src, "text": ""})
             continue
 
         valid_found = True
         try:
-            # detail=0 だとテキストのみ返る。detail=1 でも可。
             lines = reader.readtext(img, detail=0)
             text = "\n".join(lines) if lines else ""
             results.append({"index": idx, "path": src, "text": text})
         except Exception:
-            # 1枚NGでも全体は継続
             results.append({"index": idx, "path": src, "text": ""})
 
-    # 1枚も有効画像が作れなかったときはユーザに通知（Streamlitがある場合）
     if not valid_found:
-        try:
-            import streamlit as st
-            st.error("OCR用の画像を正しく読み込めませんでした（パス・形式・抽出処理をご確認ください）。")
-        except Exception:
-            pass
+        st.error("OCR用の画像を正しく読み込めませんでした（パス・形式・抽出処理をご確認ください）。")
 
     return results
 
-# ---------------------- 整形(生成AIなし) ----------------------
 
+# ========== 整形(生成AIなし) ==========
 def to_verbatim_with_timestamps(segments: List[Tuple[str, float, float]]) -> str:
     lines: List[str] = []
     for t, s, e in segments:
@@ -468,8 +494,7 @@ def heuristic_guideline_commentary(slide_groups: List[Dict[str, Any]], ocr_notes
     return "\n".join(lines).strip()
 
 
-# ---------------------- 目的別プロンプト（記事化/要旨/議事録 用） ----------------------
-
+# ========== LLM（記事化/要旨/議事録） ==========
 PURPOSE_PROMPTS = {
     "学会発表": (
         "以下の素材（音声逐語と任意のスライドOCR要約）から、学会報告記事を作成してください。"
@@ -491,23 +516,14 @@ PURPOSE_PROMPTS = {
 }
 
 
-# ---------------------- LLM 出力（記事化/要旨/議事録） ----------------------
-
 def llm_rewrite(kind: str, text: str, api_key: str | None,
                 purpose: str | None = None,
                 source_lang: str | None = None,
                 target_lang: str | None = "ja") -> str:
-    """
-    記事化・要旨・議事録・逐語（軽整形）用。
-    ※ 直訳は使わず、別関数 llm_translate_only() を使うこと！
-    """
     if openai_mod is None:
         return "[LLM未インストール] `pip install -U openai` を実行してください。"
-
     if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        return "[APIキー未入力] サイドバーでAPIキーを入れるか、環境変数 OPENAI_API_KEY を設定してください。"
+        return "[APIキー未入力] サイドバーでAPIキーを入れてください。"
 
     sys_prompt = (
         "あなたは医学・医療系の日本語編集者です。臨床・学術文脈に沿って、"
@@ -563,22 +579,13 @@ def llm_rewrite(kind: str, text: str, api_key: str | None,
     return result
 
 
-# ---------------------- LLM 直訳（翻訳専用・整形一切なし） ----------------------
-
 def llm_translate_only(text: str, api_key: str | None,
                        source_lang: str | None = None,
                        target_lang: str = "ja") -> str:
-    """
-    逐語的な翻訳に特化。記事化プロンプトを一切付けない。
-    - 要約・見出し・箇条書きの追加は禁止
-    - 「【AI整形】」等のヘッダーも付けない
-    """
     if openai_mod is None:
         return "[LLM未インストール] `pip install -U openai` を実行してください。"
     if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        return "[APIキー未入力] サイドバーでAPIキーを入れるか、環境変数 OPENAI_API_KEY を設定してください。"
+        return "[APIキー未入力] サイドバーでAPIキーを入れてください。"
 
     sys_prompt = (
         "あなたは忠実な専門翻訳者です。以下のテキストを逐語的に日本語へ翻訳してください。"
@@ -612,22 +619,14 @@ def llm_translate_only(text: str, api_key: str | None,
     except Exception as e:
         return f"[LLMエラー] {e}"
 
-# ---------------------- LLM: 直訳日本語 → 記事調（重複以外を削らない） ----------------------
+
 def llm_article_from_literal(literal_ja: str,
                              api_key: str | None,
                              purpose: str | None = "学会発表") -> str:
-    """
-    逐語直訳（日本語）を素材に、削りすぎを避けつつ記事調（常体）へ整文。
-    - 重複以外は削らない（=意味の落ちを防ぐ）
-    - 数値・試験名・薬剤名は保持
-    - 語順やつなぎの調整は可（読みやすさ確保）
-    """
     if openai_mod is None:
         return "[LLM未インストール] `pip install -U openai` を実行してください。"
     if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        return "[APIキー未入力] サイドバーでAPIキーを入れるか、OPENAI_API_KEY を設定してください。"
+        return "[APIキー未入力] サイドバーでAPIキーを入れてください。"
 
     sys_prompt = (
         "あなたは医療・医学分野の編集者。入力は既に日本語へ逐語直訳された原稿。"
@@ -635,7 +634,7 @@ def llm_article_from_literal(literal_ja: str,
         "【厳守】重複以外の削除禁止／数値・試験名・薬剤名・用量・単位は保持。"
         "見出しは『導入/背景/目的/方法/結果/考察/結語』の順で一度だけ。"
         "脚色・新情報の追加は禁止。"
-        "文末は常体（〜だ／〜である）に統一し、です・ます調は禁止。"  # ← 追加
+        "文末は常体（〜だ／〜である）に統一し、です・ます調は禁止。"
     )
     preface = {
         "学会発表": "学会報告の速報トーンで、専門読者向けに簡潔で正確に。",
@@ -662,19 +661,7 @@ def llm_article_from_literal(literal_ja: str,
           "- 冗長な重複は統合。その他の内容は残す（削りすぎ禁止）。\n"
           "- 数値・用語はそのまま保持。\n"
           "- 箇条書きではなく段落ごとにまとめ、論理的な流れを持たせる。\n"
-          "- 試験背景→方法→患者背景→結果→解釈→制限→結論の流れを基本とする。\n"
-          "- 全体のボリュームを落とさず、原文と同等の情報量を保つ。\n"
-          "- 要約ではなく、構成整理と文体変換を主目的とする。\n"
-          "- 医学系ニュース記事や学術誌速報記事にふさわしい文体を用いる。\n"
-          "- 演者が提示した患者背景、手技特徴、薬物療法の詳細は必ず含める（数値・割合・レジメンを省略しない）。\n"
-          "- 結果部分は逐語性を優先し、省略や要約は一切禁止する（統計値・HR・P値・イベント率などを必ず残す）。\n"
-          "- 月数の表記は「か月」ではなく「ヶ月」を用いる（例：6ヶ月、12ヶ月）。\n"
-          "- 英語スクリプトに含まれる「結果」の逐語内容は削らず、全て日本語に反映する。\n"
-          "- 結果に関する逐語的な統計数値・発言内容（イベント率・ハザード比・p値・サブ解析など）は省略禁止。\n"
           "- 結果は逐語スクリプトの情報量を保持したまま記事調に整えること。\n"
-          "- 出力は入力と同等の情報量を保持し、文字数はおおむね {int(target_chars*0.95)}〜{int(target_chars*1.05)} 文字（±5%）に収める。\n"
-          "- 短縮・要約を禁止。段落整理・文体整形・フォーマット化のみ行う。\n"
-          "- 結果・患者背景・手技・薬物療法・限界・考察の逐語情報は省略禁止（統計値・イベント率・HR・95%CI・p値・サブ解析を含む）。\n"
     )
 
     client = openai_mod.OpenAI(api_key=api_key) if hasattr(openai_mod, "OpenAI") else None
@@ -699,8 +686,8 @@ def llm_article_from_literal(literal_ja: str,
     except Exception as e:
         return f"[LLMエラー] {e}"
 
-# ---------------------- DOCX出力 ----------------------
 
+# ========== DOCX 出力 ==========
 def make_docx(title: str, content: str) -> bytes:
     doc = Document()
     style = doc.styles['Normal']
@@ -721,13 +708,13 @@ def make_docx(title: str, content: str) -> bytes:
     return buf.read()
 
 
-# ---------------------- Streamlit UI ----------------------
-
+# ========== Streamlit UI ==========
 def main():
     st.set_page_config(page_title="InsighTCROSS® Smart Writer v11", layout="wide")
-    # 🔐 最初に認証をかける
-    require_password()
-        
+
+    # 1) ログイン＆APIキー入力（毎回）
+    api_key = require_login_and_api()
+
     if "workdir" not in st.session_state:
         st.session_state["workdir"] = os.path.abspath("./.work")
         os.makedirs(st.session_state["workdir"], exist_ok=True)
@@ -737,15 +724,15 @@ def main():
         st.session_state["transcript_text"] = ""
     if "generated_text" not in st.session_state:
         st.session_state["generated_text"] = ""
-    st.write("音声/動画をアップロードして、逐語・直訳・議事録・要旨・記事に整形。動画はスライドOCR併用も可能。生成AIは任意です。")
+    st.write("音声/動画をアップロードして、逐語・直訳・議事録・要旨・記事に整形。動画はスライドOCR併用も可能。")
 
     with st.sidebar:
         st.header("設定")
         file_type = st.radio("ファイルタイプ", ["自動判定", "音声", "動画"], index=0)
         use_slide_ocr = st.toggle("スライドOCRも併用（動画時）", value=False,
-                                  help="スライドのキーフレームを抽出しOCRで文字も取り込みます")
+                                  help="スライドのキーフレームを抽出しOCRで文字も取り込みます（依存が無ければ空で継続）")
         scene_sensitivity = st.slider("シーン変化感度", 0.10, 0.60, 0.35, 0.01)
-       
+
         output_lang_label = st.selectbox("出力言語", ["日本語 (JPN)", "English (EN)"], index=0)
         output_lang = "ja" if "JPN" in output_lang_label else "en"
 
@@ -757,12 +744,6 @@ def main():
         attach_verbatim = st.toggle("末尾に逐語原文を添付", value=False,
                                     help="原文言語の逐語テキストを末尾に付けます（通常はOFF推奨）")
         use_llm = st.toggle("生成AIで整形（任意）", value=False)
-        api_key_input = ""
-        if use_llm:
-            api_key_input = st.text_input("OpenAI API Key", type="password",
-                                          help="未入力なら環境変数 OPENAI_API_KEY を参照")
-            if not api_key_input:
-                st.warning("生成AIで整形がONですが APIキーが未入力です。AI整形は実行されず、元言語のまま出力されます。")
 
     uploaded = st.file_uploader(
         "音声/動画ファイルをアップロード (mp3, m4a, wav, mp4, mov など)",
@@ -781,10 +762,9 @@ def main():
         wav_path = ensure_wav(temp_path)
 
     with st.spinner("🧠 OpenAIで文字起こし中…"):
-        segments, detected_lang = transcribe_openai(wav_path)
+        segments, detected_lang = transcribe_openai(wav_path, api_key)
 
     st.success(f"文字起こし完了。セグメント数: {len(segments)} / 言語検出: {detected_lang}")
-
 
     # 逐語（タイムスタンプ付き）原稿
     verbatim_text = to_verbatim_with_timestamps(segments)
@@ -807,7 +787,6 @@ def main():
                 scene_thr=scene_sensitivity,
             )
 
-            # === ここから追加の見える化デバッグ ===
             st.write(f"抽出フレーム枚数: {len(frames)} / 切替検出: {len(slide_times)}")
             if frames:
                 st.write("先頭3枚のパス:", frames[:3])
@@ -817,7 +796,6 @@ def main():
                     st.warning(f"プレビュー表示に失敗: {e}")
             else:
                 st.warning("抽出された画像が0枚です。フォールバックが効いていない可能性があります。")
-            # === ここまで追加 ===
 
             slide_notes = ocr_slides(frames)
             slide_groups = group_segments_by_slides(segments, slide_times)
@@ -849,7 +827,7 @@ def main():
             f"【音声逐語】\n{cleaned_for_llm}\n\n【スライドOCR】\n{slide_digest}"
         )
 
-    # ---- 既定（ヒューリスティック）出力
+    # 既定（ヒューリスティック）出力
     if out_kind == "逐語(タイムスタンプ)":
         base_out = to_verbatim_with_timestamps(segments); kind_key = "verbatim"
     elif out_kind == "議事録":
@@ -865,7 +843,7 @@ def main():
 
     final_out = base_out
 
-    # ---------------- 生成AIで整形ボタン ----------------
+    # 生成AIで整形ボタン
     st.markdown("---")
     st.subheader("🧠 生成AIで整形する")
     label_lang = "日本語" if output_lang == "ja" else "English"
@@ -876,79 +854,74 @@ def main():
         return
 
     # 押下後
-    if use_llm and not api_key_input:
-        st.error("生成AIで整形がONですが APIキーが未入力です。AI整形は実行できません。")
+    if use_llm is False:
+        st.info("生成AIがOFFのため、ヒューリスティック整形の結果を表示します。")
+        st.text_area("結果テキスト", value=final_out or "", height=400)
+        return
+
+    if not api_key:
+        st.error("生成AIの整形には OpenAI APIキーが必要です（サイドバーで入力）。")
         st.stop()
-    
-    # （任意）古い直訳をクリアしておく
+
     st.session_state.pop("ja_literal_for_article", None)
 
     final_out = base_out
     try:
-        if use_llm and api_key_input:
-            if out_kind == "逐語(タイムスタンプ)":
-                with st.spinner("生成AIで整形中..."):
-                    final_out = llm_rewrite(
-                        kind="verbatim",
-                        text="【出力は必ず日本語】\n" + st.session_state["transcript_text"],
-                        api_key=api_key_input,
+        if out_kind == "逐語(タイムスタンプ)":
+            with st.spinner("生成AIで整形中..."):
+                final_out = llm_rewrite(
+                    kind="verbatim",
+                    text="【出力は必ず日本語】\n" + st.session_state["transcript_text"],
+                    api_key=api_key,
+                    purpose=purpose,
+                    source_lang=detected_lang,
+                    target_lang=output_lang,
+                )
+        elif out_kind == "直訳（日本語化のみ）":
+            with st.spinner("英語→日本語 直訳中..."):
+                final_out = llm_translate_only(
+                    text=cleaned_for_llm,
+                    api_key=api_key,
+                    source_lang=detected_lang,
+                    target_lang="ja",
+                )
+        else:
+            if out_kind == "記事" and (output_lang == "ja"):
+                with st.spinner("英語→日本語 直訳 → 記事調 へ整形中..."):
+                    ja_literal_for_article = llm_translate_only(
+                        text=cleaned_for_llm,
+                        api_key=api_key,
+                        source_lang=detected_lang,
+                        target_lang="ja",
+                    )
+                    final_out = llm_article_from_literal(
+                        literal_ja=ja_literal_for_article,
+                        api_key=api_key,
+                        purpose=purpose,
+                    )
+                    st.caption("route: ARTICLE_FROM_LITERAL (ja) ✓ 直訳→記事調ルートを通過")
+                    st.session_state["ja_literal_for_article"] = ja_literal_for_article
+            else:
+                llm_kind_call = {"議事録": "minutes", "要旨": "abstract"}.get(out_kind, "article")
+                parts = split_text_by_chars(llm_source, chunk_size=6000, overlap=300)
+                outs = []
+                N = len(parts)
+                for i, part in enumerate(parts, start=1):
+                    meta = (
+                        f"【分割パート {i}/{N}】\n"
+                        "このパートでは新規情報のみを反映し、既出の見出しや導入は再掲しないでください。"
+                    )
+                    out_i = llm_rewrite(
+                        kind=llm_kind_call,
+                        text="【出力は必ず日本語】\n" + meta + "\n\n" + part,
+                        api_key=api_key,
                         purpose=purpose,
                         source_lang=detected_lang,
                         target_lang=output_lang,
                     )
-            elif out_kind == "直訳（日本語化のみ）":
-                with st.spinner("英語→日本語 直訳中..."):
-                    final_out = llm_translate_only(
-                        text=cleaned_for_llm,              # タイムスタンプ除去版を翻訳
-                        api_key=api_key_input,
-                        source_lang=detected_lang,
-                        target_lang="ja",
-                    )
-            else:
-                # ★★★ ここから追加：記事だけ“直訳→記事調”に切り替える ★★★
-                if out_kind == "記事" and (output_lang == "ja"):
-                    with st.spinner("英語→日本語 直訳 → 記事調 へ整形中..."):
-                        # 1) まずタイムスタンプ除去版を“直訳（日本語）”
-                        ja_literal_for_article = llm_translate_only(
-                            text=cleaned_for_llm,
-                            api_key=api_key_input,
-                            source_lang=detected_lang,
-                            target_lang="ja",
-                        )
-                        # 2) 直訳を素材に、重複だけを整理し“記事調（常体）”に
-                        final_out = llm_article_from_literal(
-                            literal_ja=ja_literal_for_article,
-                            api_key=api_key_input,
-                            purpose=purpose,
-                        )
-                        # ★ この直後に置く
-                        st.caption("route: ARTICLE_FROM_LITERAL (ja) ✓ 直訳→記事調ルートを通過")
-                        
-                        # ★ 追加：プレビュー用にも同じ直訳を使えるよう保存
-                        st.session_state["ja_literal_for_article"] = ja_literal_for_article
-                else:
-                    llm_kind_call = {"議事録": "minutes", "要旨": "abstract"}.get(out_kind, "article")
-                    parts = split_text_by_chars(llm_source, chunk_size=6000, overlap=300)
-                    outs = []
-                    N = len(parts)
-                    for i, part in enumerate(parts, start=1):
-                        meta = (
-                            f"【分割パート {i}/{N}】\n"
-                            "このパートでは新規情報のみを反映し、既出の見出しや導入は再掲しないでください。"
-                        )
-                        out_i = llm_rewrite(
-                            kind=llm_kind_call,
-                            text="【出力は必ず日本語】\n" + meta + "\n\n" + part,
-                            api_key=api_key_input,
-                            purpose=purpose,
-                            source_lang=detected_lang,
-                            target_lang=output_lang,
-                        )
-                        outs.append(out_i.strip())
-                    final_out = "\n\n".join(outs)
-            st.success("生成AIでの整形が完了しました。")
-        else:
-            st.info("生成AIがOFFのため、ヒューリスティック整形で出力しました。")
+                    outs.append(out_i.strip())
+                final_out = "\n\n".join(outs)
+        st.success("生成AIでの整形が完了しました。")
     except Exception as e:
         st.error(f"整形に失敗しました: {e}")
 
@@ -957,7 +930,7 @@ def main():
     st.text_area("原文", value=cleaned_for_llm, height=260)
 
     st.subheader("🇯🇵 英語→日本語（直訳・整形なし）")
-    if use_llm and api_key_input:
+    if use_llm and api_key:
         cached_literal = st.session_state.get("ja_literal_for_article")
         if cached_literal:
             ja_literal = cached_literal
@@ -965,13 +938,13 @@ def main():
             with st.spinner("英語→日本語 直訳（プレビュー用）..."):
                 ja_literal = llm_translate_only(
                     text=cleaned_for_llm,
-                    api_key=api_key_input,
+                    api_key=api_key,
                     source_lang=detected_lang,
                     target_lang="ja",
                 )
         st.text_area("直訳", value=ja_literal, height=260)
     else:
-        st.text_area("直訳", value="(APIキー未入力または生成AIがOFFのため直訳は表示できません)", height=260)
+        st.text_area("直訳", value="(生成AIがOFFまたはAPIキー未入力のため直訳は表示できません)", height=260)
 
     st.subheader("📄 整形結果プレビュー")
     if out_kind == "ガイドライン解説" and output_lang == "ja" and final_out:
