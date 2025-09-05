@@ -975,18 +975,18 @@ def main():
     final_out = base_out
 
   # ----- ここから置き換え（ボタン＋自動実行） -----
-st.markdown("---")
-st.subheader("🧠 生成AIで整形する")
-label_lang = "日本語" if output_lang == "ja" else "English"
-
-# 生成AIトグルONなら自動実行。OFFならボタンで実行。
-auto_generate = use_llm
-clicked = st.button(f"✨ 生成AIで整形（{label_lang}で出力）")
-
-do_generate = auto_generate or clicked
-if not do_generate:
-    st.text_area("結果テキスト", value=final_out or "", height=400)
-    return
+    st.markdown("---")
+    st.subheader("🧠 生成AIで整形する")
+    label_lang = "日本語" if output_lang == "ja" else "English"
+    
+    # 生成AIトグルONなら自動実行。OFFならボタンで実行。
+    auto_generate = use_llm
+    clicked = st.button(f"✨ 生成AIで整形（{label_lang}で出力）")
+    
+    do_generate = auto_generate or clicked
+    if not do_generate:
+        st.text_area("結果テキスト", value=final_out or "", height=400)
+        return
 # ----- 置き換えここまで -----
     # 押下後
     if use_llm is False:
