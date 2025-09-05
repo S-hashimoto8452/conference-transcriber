@@ -16,6 +16,8 @@ import glob
 import shutil
 import subprocess
 import mimetypes
+import json
+import traceback
 from datetime import timedelta
 import re
 from typing import List, Tuple, Dict, Any
@@ -282,72 +284,83 @@ def fmt_ts(x: float) -> str:
 
 
 # ========== OpenAI で文字起こし ==========
-# ========== OpenAI で文字起こし ==========
-def transcribe_openai(
-    wav_path: str,
-    api_key: str,
-    forced_lang: str | None = None
-) -> tuple[list[tuple[str, float, float]], str | None]:
-    """OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。"""
-    # 公式の OpenAI エンドポイントを明示（環境変数の影響を受けない）
-    client = OpenAI(api_key=api_key, base_url="https://api.openai.com/v1")
+def _safe_lang(forced_lang: str | None):
+    if not forced_lang:
+        return None
+    lang = forced_lang.strip().lower()
+    if lang in {"auto", "detect", "none", ""}:
+        return None
+    if len(lang) != 2:
+        return None
+    return lang
 
-    # モデルは環境変数で上書き可。未指定は whisper-1
-    candidates = [os.environ.get("OPENAI_TRANSCRIBE_MODEL") or "", "whisper-1"]
-    candidates = [m for m in candidates if m]
-
+def transcribe_openai(wav_path: str, api_key: str, forced_lang: str | None = None):
+    import os, time
+    from openai import OpenAI
+    start = time.time()
     last_err = None
-    with open(wav_path, "rb") as f:
-        # 1) verbose_json でセグメント取得を試す
-        for m in candidates:
+    try:
+        if not api_key:
+            raise ValueError("OpenAI API key is empty. Set OPENAI_API_KEY or provide api_key.")
+        if not wav_path or not os.path.exists(wav_path):
+            raise FileNotFoundError(f"Audio file not found: {wav_path}")
+
+        file_size_mb = os.path.getsize(wav_path) / (1024 * 1024)
+        if file_size_mb > 24.5:
+            raise RuntimeError(f"Audio file is too large ({file_size_mb:.1f} MB). Please chunk or compress.")
+
+        client = OpenAI(api_key=api_key)
+        language = _safe_lang(forced_lang)
+
+        with open(wav_path, "rb") as f:
             try:
+                resp = client.audio.transcriptions.create(
+                    model="gpt-4o-mini-transcribe",
+                    file=f,
+                    language=language
+                )
+            except Exception as e1:
+                last_err = e1
                 f.seek(0)
-                kwargs = {
-                    "model": m,
-                    "file": f,
-                    "response_format": "verbose_json",
-                }
-                # ★ 言語を強制指定（英語/日本語/自動）
-                if forced_lang:
-                    kwargs["language"] = forced_lang
+                resp = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language=language
+                )
 
-                resp = client.audio.transcriptions.create(**kwargs)
+        text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
+        if not text:
+            raise RuntimeError("OpenAI returned empty transcription text.")
 
-                text = getattr(resp, "text", "") or ""
-                segs = []
-                seg_attr = getattr(resp, "segments", None)
-                if seg_attr:
-                    for s in seg_attr:
-                        if isinstance(s, dict):
-                            t = (s.get("text") or "").strip()
-                            stt = float(s.get("start", 0.0) or 0.0)
-                            endt = float(s.get("end", 0.0) or 0.0)
-                        else:
-                            t = (getattr(s, "text", "") or "").strip()
-                            stt = float(getattr(s, "start", 0.0) or 0.0)
-                            endt = float(getattr(s, "end", 0.0) or 0.0)
-                        segs.append((t, stt, endt))
-                else:
-                    segs = [(text, float("nan"), float("nan"))]
+        detected_lang = language or "auto"
+        st.sidebar.info(f"Transcribed in {time.time()-start:.1f}s, size={file_size_mb:.1f}MB, lang={detected_lang}")
+        segments = [{"start": 0.0, "end": 0.0, "text": text}]
+        return segments, detected_lang
 
-                # 表示用の検出言語。強制した場合はそのコードを採用
-                detected = forced_lang or getattr(resp, "language", None)
-                return segs, detected
-            except Exception as e:
-                last_err = e
-
-        # 2) フォールバック：テキストのみ
+    except Exception as e:
+        tb = traceback.format_exc()
+        debug_blob = {
+            "where": "transcribe_openai",
+            "wav_path": wav_path,
+            "forced_lang": forced_lang,
+            "safe_lang": _safe_lang(forced_lang),
+            "file_exists": os.path.exists(wav_path) if wav_path else False,
+            "file_size_mb": (os.path.getsize(wav_path) / (1024*1024)) if (wav_path and os.path.exists(wav_path)) else None,
+            "last_err_type": type(last_err).__name__ if last_err else None,
+            "last_err_str": str(last_err) if last_err else None,
+            "caught_err_type": type(e).__name__,
+            "caught_err": str(e),
+        }
+        st.error("Transcription failed. See diagnostics below.")
+        st.code(json.dumps(debug_blob, ensure_ascii=False, indent=2))
+        st.code(tb)
         try:
-            f.seek(0)
-            fallback_model = candidates[-1] if candidates else "whisper-1"
-            kwargs = {"model": fallback_model, "file": f}
-            if forced_lang:
-                kwargs["language"] = forced_lang
-            resp = client.audio.transcriptions.create(**kwargs)
-            text = getattr(resp, "text", "") or ""
-            return [(text, float("nan"), float("nan"))], forced_lang or None
-        except Exception as e:
-            raise RuntimeError(f"Transcription failed: {last_err or e}")
+            with open("/mount/src/transcribe_error.log", "a", encoding="utf-8") as logf:
+                logf.write(json.dumps(debug_blob, ensure_ascii=False) + "\n")
+                logf.write(tb + "\n")
+        except Exception:
+            pass
+        raise RuntimeError(f"Transcription failed: {last_err or e}")
 
 # ========== スライドと発話の対応付け ==========
 def group_segments_by_slides(
@@ -1091,6 +1104,35 @@ def main():
     docx_bytes = make_docx(title=f"{out_kind}（{purpose}）", content=final_out)
     st.download_button("DOCXダウンロード", data=docx_bytes, file_name="output.docx")
 
+if st.sidebar.button("🔎 10秒サンプルで転写テスト"):
+    try:
+        test_wav = "/mount/src/sample_10s.wav"  # ここに短いwavを置いておく
+        segs, lang = transcribe_openai(test_wav, api_key=os.environ.get("OPENAI_API_KEY", ""), forced_lang="ja")
+        st.success(f"Sample OK. lang={lang}")
+        st.write(segs[0]["text"][:500])
+    except Exception as e:
+        st.error(f"Sample failed: {e}")
+
+# --- 転写ミニ自己診断（main() の前）---
+if "OPENAI_API_KEY" not in os.environ or not os.environ["OPENAI_API_KEY"].strip():
+    st.sidebar.warning("OPENAI_API_KEY が未設定です。Secrets か環境変数で設定してください。")
+
+if st.sidebar.button("🔎 10秒サンプルで転写テスト"):
+    test_wav = "/mount/src/sample_10s.wav"  # ここに短い wav を1個置く
+    if not os.path.exists(test_wav):
+        st.error(f"サンプル音声が見つかりません: {test_wav}")
+    else:
+        try:
+            segs, lang = transcribe_openai(
+                test_wav,
+                api_key=os.environ.get("OPENAI_API_KEY", ""),
+                forced_lang="ja"
+            )
+            st.success(f"Sample OK. lang={lang}")
+            st.write(segs[0]["text"][:500])
+        except Exception as e:
+            st.error(f"Sample failed: {e}")
 
 if __name__ == "__main__":
+    
     main()
