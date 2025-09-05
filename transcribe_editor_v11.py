@@ -1104,35 +1104,6 @@ def main():
     docx_bytes = make_docx(title=f"{out_kind}（{purpose}）", content=final_out)
     st.download_button("DOCXダウンロード", data=docx_bytes, file_name="output.docx")
 
-if st.sidebar.button("🔎 10秒サンプルで転写テスト"):
-    try:
-        test_wav = "/mount/src/sample_10s.wav"  # ここに短いwavを置いておく
-        segs, lang = transcribe_openai(test_wav, api_key=os.environ.get("OPENAI_API_KEY", ""), forced_lang="ja")
-        st.success(f"Sample OK. lang={lang}")
-        st.write(segs[0]["text"][:500])
-    except Exception as e:
-        st.error(f"Sample failed: {e}")
-
-# --- 転写ミニ自己診断（main() の前）---
-if "OPENAI_API_KEY" not in os.environ or not os.environ["OPENAI_API_KEY"].strip():
-    st.sidebar.warning("OPENAI_API_KEY が未設定です。Secrets か環境変数で設定してください。")
-
-if st.sidebar.button("🔎 10秒サンプルで転写テスト"):
-    test_wav = "/mount/src/sample_10s.wav"  # ここに短い wav を1個置く
-    if not os.path.exists(test_wav):
-        st.error(f"サンプル音声が見つかりません: {test_wav}")
-    else:
-        try:
-            segs, lang = transcribe_openai(
-                test_wav,
-                api_key=os.environ.get("OPENAI_API_KEY", ""),
-                forced_lang="ja"
-            )
-            st.success(f"Sample OK. lang={lang}")
-            st.write(segs[0]["text"][:500])
-        except Exception as e:
-            st.error(f"Sample failed: {e}")
-
 if __name__ == "__main__":
     
     main()
