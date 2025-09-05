@@ -26,8 +26,7 @@ from pydub import AudioSegment
 from pydub.utils import which
 from docx import Document
 from docx.shared import Pt
-
-from faster_whisper import WhisperModel
+from openai import OpenAI
 
 # 任意: OpenAI
 try:
@@ -43,6 +42,11 @@ except Exception:
 
 import math
 from pathlib import Path
+
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    base_url=os.environ.get("OPENAI_BASE_URL")  # 通常のOpenAIなら未設定でOK
+)
 
 # 🔐 パスワード認証用関数
 def require_password():
@@ -74,7 +78,7 @@ def require_password():
 
     if not st.session_state.get("auth_ok", False):
         st.stop()
-
+    
 # ---------------------- ユーティリティ ----------------------
 
 def split_text_by_chars(text: str, chunk_size: int = 6000, overlap: int = 300) -> list[str]:
@@ -172,6 +176,48 @@ def format_timestamp(seconds: float) -> str:
     ms = int((td.total_seconds() - total_seconds) * 1000)
     return f"{total_seconds//3600:02d}:{(total_seconds%3600)//60:02d}:{total_seconds%60:02d}.{ms:03d}"
 
+def transcribe_openai(wav_path: str) -> tuple[list[tuple[str, float, float]], str | None]:
+    """
+    OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。
+    戻り値: [(text, start, end), ...], detected_language(or None)
+    """
+    prefer = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+    candidates = [prefer, "whisper-1"]
+
+    with open(wav_path, "rb") as f:
+        last_err = None
+        # 1) verbose_json でセグメント取得を試す
+        for m in candidates:
+            try:
+                f.seek(0)
+                resp = client.audio.transcriptions.create(
+                    model=m,
+                    file=f,
+                    response_format="verbose_json",
+                )
+                text = resp.text
+                segs = []
+                if getattr(resp, "segments", None):
+                    for s in resp.segments:
+                        segs.append((
+                            (s.get("text") or "").strip(),
+                            float(s.get("start", 0.0)),
+                            float(s.get("end", 0.0)),
+                        ))
+                else:
+                    segs = [(text, float("nan"), float("nan"))]
+                detected = getattr(resp, "language", None)
+                return segs, detected
+            except Exception as e:
+                last_err = e
+
+        # 2) フォールバック：テキストのみ
+        f.seek(0)
+        try:
+            resp = client.audio.transcriptions.create(model=candidates[-1], file=f)
+            return [(resp.text, float("nan"), float("nan"))], None
+        except Exception as e:
+            raise RuntimeError(f"Transcription failed: {last_err or e}")
 
 def fmt_ts(x: float) -> str:
     return format_timestamp(x) if math.isfinite(x) else "…"
@@ -194,31 +240,6 @@ def group_segments_by_slides(
                 bucket.append((t, max(s, start), min(e, end)))
         grouped.append({"index": i+1, "start": start, "end": end, "segments": bucket})
     return grouped
-
-
-# ---------------------- 文字起こし本体 ----------------------
-
-def transcribe_faster_whisper(
-    wav_path: str,
-    model_size: str = "small",
-    language: str | None = "auto",
-    compute_type: str = "auto",
-    beam_size: int = 5,
-) -> tuple[list[tuple[str, float, float]], str | None]:
-    lang_arg = None if (language is None or str(language).lower() == "auto") else language
-    model = WhisperModel(model_size, device="auto", compute_type=compute_type)
-    segments_gen, info = model.transcribe(
-        wav_path,
-        language=lang_arg,
-        beam_size=beam_size,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-    )
-    results: list[tuple[str, float, float]] = []
-    for seg in segments_gen:
-        results.append((seg.text.strip(), seg.start, seg.end))
-    detected = getattr(info, "language", None)
-    return results, detected
 
 
 # ---------------------- スライド抽出 & OCR ----------------------
@@ -724,11 +745,7 @@ def main():
         use_slide_ocr = st.toggle("スライドOCRも併用（動画時）", value=False,
                                   help="スライドのキーフレームを抽出しOCRで文字も取り込みます")
         scene_sensitivity = st.slider("シーン変化感度", 0.10, 0.60, 0.35, 0.01)
-
-        model_size = st.selectbox("Whisperモデル", ["tiny","base","small","medium"], index=2)
-        compute_type = st.selectbox("Compute type", ["auto","int8","int8_float16","float16","float32"], index=0)
-        language = st.text_input("言語コード", value="auto")
-
+       
         output_lang_label = st.selectbox("出力言語", ["日本語 (JPN)", "English (EN)"], index=0)
         output_lang = "ja" if "JPN" in output_lang_label else "en"
 
@@ -762,11 +779,8 @@ def main():
 
     with st.spinner("変換中（WAV 16kHz mono）..."):
         wav_path = ensure_wav(temp_path)
-    segments, detected_lang = transcribe_faster_whisper(
-        wav_path=wav_path,
-        model_size=model_size,
-        language="en",
-        compute_type=compute_type,
+    segments, detected_lang = transcribe_openai(wav_path)
+
     )
     st.success(f"文字起こし完了。セグメント数: {len(segments)} / 言語検出: {detected_lang}")
 
