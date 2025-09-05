@@ -778,7 +778,7 @@ def main():
     is_video = (file_type == "動画") or (file_type == "自動判定" and guessed.startswith("video/"))
 
     with st.spinner("変換中（WAV 16kHz mono）..."):
-    wav_path = ensure_wav(temp_path)
+        wav_path = ensure_wav(temp_path)
 
     with st.spinner("🧠 OpenAIで文字起こし中…"):
         segments, detected_lang = transcribe_openai(wav_path)
