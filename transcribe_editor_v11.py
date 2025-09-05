@@ -54,13 +54,16 @@ except Exception:
     cv2 = None
     Image = None
 
-# OpenAIクライアントを安全に生成（base_urlは設定されているときだけ渡す）
+# OpenAIクライアントを安全に生成
 def get_openai_client(api_key: str) -> OpenAI:
-    base = (os.environ.get("OPENAI_BASE_URL") or "").strip()
-    kwargs = {"api_key": api_key}
-    if base:  # 空文字は渡さない！
-        kwargs["base_url"] = base
-    return OpenAI(**kwargs)
+    base = os.environ.get("OPENAI_BASE_URL")
+    if isinstance(base, str):
+        base = base.strip()
+        # 正しいURLのときだけ base_url を渡す
+        if base.lower().startswith(("http://", "https://")):
+            return OpenAI(api_key=api_key, base_url=base)
+    # 通常のOpenAIを使うときは base_url を渡さない
+    return OpenAI(api_key=api_key)
 
 # ========== ランタイム共通ストア（起動中のみ保持。毎回の起動時に設定し直し） ==========
 @st.cache_resource(show_spinner=False)
@@ -69,8 +72,6 @@ def runtime_config():
         "common_password": None,   # 初回セットアップで管理者が設定
         "default_api_key": None,   # 任意：既定のAPIキー。未設定なら各ユーザーが毎回入力
     }
-
-
 # ========== ログイン＆APIキー取得（毎回サイドバーで入力） ==========
 def require_login_and_api() -> str:
     cfg = runtime_config()
@@ -260,10 +261,9 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
     """
     client = get_openai_client(api_key)
 
-    # 推奨: まずは whisper-1 を優先（安定）
-    # gpt-4o-mini-transcribe を使いたければ上に置いてください
+    # 環境変数でモデル指定があれば優先、なければ whisper-1 を使う
     candidates = [os.environ.get("OPENAI_TRANSCRIBE_MODEL") or "", "whisper-1"]
-    candidates = [m for m in candidates if m]  # 空を除去
+    candidates = [m for m in candidates if m]  # 空文字を除去
 
     last_err = None
     with open(wav_path, "rb") as f:
@@ -276,15 +276,20 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
                     file=f,
                     response_format="verbose_json",
                 )
-                text = resp.text
+                text = getattr(resp, "text", "") or ""
                 segs = []
                 if getattr(resp, "segments", None):
                     for s in resp.segments:
-                        segs.append((
-                            (s.get("text") or "").strip(),
-                            float(s.get("start", 0.0)),
-                            float(s.get("end", 0.0)),
-                        ))
+                        # dict/obj どちらでも安全に取れるように
+                        if isinstance(s, dict):
+                            t = (s.get("text") or "").strip()
+                            stt = float(s.get("start", 0.0) or 0.0)
+                            endt = float(s.get("end", 0.0) or 0.0)
+                        else:
+                            t = (getattr(s, "text", "") or "").strip()
+                            stt = float(getattr(s, "start", 0.0) or 0.0)
+                            endt = float(getattr(s, "end", 0.0) or 0.0)
+                        segs.append((t, stt, endt))
                 else:
                     segs = [(text, float("nan"), float("nan"))]
                 detected = getattr(resp, "language", None)
@@ -295,12 +300,13 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
         # 2) フォールバック：テキストのみ
         try:
             f.seek(0)
-            # 最後の候補（通常 whisper-1）でテキストだけ取得
             fallback_model = candidates[-1] if candidates else "whisper-1"
             resp = client.audio.transcriptions.create(model=fallback_model, file=f)
-            return [(resp.text, float("nan"), float("nan"))], None
+            text = getattr(resp, "text", "") or ""
+            return [(text, float("nan"), float("nan"))], None
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {last_err or e}")
+
 
 # ========== スライドと発話の対応付け ==========
 def group_segments_by_slides(
@@ -318,7 +324,6 @@ def group_segments_by_slides(
                 bucket.append((t, max(s, start), min(e, end)))
         grouped.append({"index": i+1, "start": start, "end": end, "segments": bucket})
     return grouped
-
 
 # ========== スライド抽出 & OCR ==========
 def extract_slide_keyframes_with_times(video_path: str, out_dir: str, scene_thr: float=0.35) -> tuple[list[str], list[float]]:
