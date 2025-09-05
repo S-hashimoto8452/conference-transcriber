@@ -29,9 +29,6 @@ from pydub.utils import which
 from docx import Document
 from docx.shared import Pt
 
-# OpenAI SDK（v1）
-from openai import OpenAI
-
 # （LLMの整形に chat.completions を使うための互換ハンドル）
 try:
     import openai as openai_mod  # pip install openai
@@ -54,6 +51,8 @@ except Exception:
     cv2 = None
     Image = None
 
+
+from openai import OpenAI
 # OpenAIクライアントを安全に生成
 def get_openai_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key)
@@ -248,10 +247,12 @@ def fmt_ts(x: float) -> str:
 
 # ========== OpenAI で文字起こし ==========
 def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, float, float]], str | None]:
-    """
-    OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。
+    """OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。
     戻り値: [(text, start, end), ...], detected_language(or None)
     """
+    # デバッグ：どの get_openai_client が使われているか（定義行番号）を表示
+    st.caption(f"DEBUG get_openai_client defined at line {get_openai_client.__code__.co_firstlineno}")
+
     client = get_openai_client(api_key)
 
     # 環境変数でモデルが指定されていれば優先。なければ whisper-1 を使用
