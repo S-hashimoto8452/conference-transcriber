@@ -56,13 +56,6 @@ except Exception:
 
 # OpenAIクライアントを安全に生成
 def get_openai_client(api_key: str) -> OpenAI:
-    base = os.environ.get("OPENAI_BASE_URL")
-    if isinstance(base, str):
-        base = base.strip()
-        # 正しいURLのときだけ base_url を渡す
-        if base.lower().startswith(("http://", "https://")):
-            return OpenAI(api_key=api_key, base_url=base)
-    # 通常のOpenAIを使うときは base_url を渡さない
     return OpenAI(api_key=api_key)
 
 # ========== ランタイム共通ストア（起動中のみ保持。毎回の起動時に設定し直し） ==========
@@ -261,7 +254,7 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
     """
     client = get_openai_client(api_key)
 
-    # 環境変数でモデル指定があれば優先、なければ whisper-1 を使う
+    # 環境変数でモデルが指定されていれば優先。なければ whisper-1 を使用
     candidates = [os.environ.get("OPENAI_TRANSCRIBE_MODEL") or "", "whisper-1"]
     candidates = [m for m in candidates if m]  # 空文字を除去
 
@@ -278,9 +271,9 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
                 )
                 text = getattr(resp, "text", "") or ""
                 segs = []
-                if getattr(resp, "segments", None):
-                    for s in resp.segments:
-                        # dict/obj どちらでも安全に取れるように
+                seg_attr = getattr(resp, "segments", None)
+                if seg_attr:
+                    for s in seg_attr:
                         if isinstance(s, dict):
                             t = (s.get("text") or "").strip()
                             stt = float(s.get("start", 0.0) or 0.0)
@@ -306,7 +299,6 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
             return [(text, float("nan"), float("nan"))], None
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {last_err or e}")
-
 
 # ========== スライドと発話の対応付け ==========
 def group_segments_by_slides(
