@@ -54,6 +54,13 @@ except Exception:
     cv2 = None
     Image = None
 
+# OpenAIクライアントを安全に生成（base_urlは設定されているときだけ渡す）
+def get_openai_client(api_key: str) -> OpenAI:
+    base = (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    kwargs = {"api_key": api_key}
+    if base:  # 空文字は渡さない！
+        kwargs["base_url"] = base
+    return OpenAI(**kwargs)
 
 # ========== ランタイム共通ストア（起動中のみ保持。毎回の起動時に設定し直し） ==========
 @st.cache_resource(show_spinner=False)
@@ -252,11 +259,14 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
     戻り値: [(text, start, end), ...], detected_language(or None)
     """
     client = get_openai_client(api_key)
-    prefer = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-    candidates = [prefer, "whisper-1"]
 
+    # 推奨: まずは whisper-1 を優先（安定）
+    # gpt-4o-mini-transcribe を使いたければ上に置いてください
+    candidates = [os.environ.get("OPENAI_TRANSCRIBE_MODEL") or "", "whisper-1"]
+    candidates = [m for m in candidates if m]  # 空を除去
+
+    last_err = None
     with open(wav_path, "rb") as f:
-        last_err = None
         # 1) verbose_json でセグメント取得を試す
         for m in candidates:
             try:
@@ -283,13 +293,14 @@ def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, floa
                 last_err = e
 
         # 2) フォールバック：テキストのみ
-        f.seek(0)
         try:
-            resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+            f.seek(0)
+            # 最後の候補（通常 whisper-1）でテキストだけ取得
+            fallback_model = candidates[-1] if candidates else "whisper-1"
+            resp = client.audio.transcriptions.create(model=fallback_model, file=f)
             return [(resp.text, float("nan"), float("nan"))], None
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {last_err or e}")
-
 
 # ========== スライドと発話の対応付け ==========
 def group_segments_by_slides(
