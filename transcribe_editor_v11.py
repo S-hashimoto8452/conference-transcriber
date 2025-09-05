@@ -247,13 +247,10 @@ def fmt_ts(x: float) -> str:
 
 # ========== OpenAI で文字起こし ==========
 def transcribe_openai(wav_path: str, api_key: str) -> tuple[list[tuple[str, float, float]], str | None]:
-    """OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。
-    戻り値: [(text, start, end), ...], detected_language(or None)
-    """
-    # デバッグ：どの get_openai_client が使われているか（定義行番号）を表示
-    st.caption(f"DEBUG get_openai_client defined at line {get_openai_client.__code__.co_firstlineno}")
-
-    client = get_openai_client(api_key)
+    """OpenAIで文字起こし。可能ならセグメント（開始/終了）も返す。"""
+    # ✅ ヘルパーを使わず、base_url を絶対に渡さない
+    client = OpenAI(api_key=api_key)
+    st.caption("DEBUG: OpenAI(api_key) で初期化（base_url は未使用）")
 
     # 環境変数でモデルが指定されていれば優先。なければ whisper-1 を使用
     candidates = [os.environ.get("OPENAI_TRANSCRIBE_MODEL") or "", "whisper-1"]
